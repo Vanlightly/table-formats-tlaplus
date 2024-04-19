@@ -3,14 +3,16 @@ EXTENDS Integers, Naturals, FiniteSets, Sequences, SequencesExt, TLC,
         hudi_common
 
 \* The fixed number of file groups.
-CONSTANT FileGroupCount,
-         EnableFgMappingConflictCheck
+CONSTANT FileGroupCount
 
-VARIABLES file_group,     \* a map of file_id to one or more file slices
-          fg_key_mapping  \* the mapping of key -> file_id
+\* Primary key conflict detection
+CONSTANT PrimaryKeyConflictCheck
+
+VARIABLES file_group,     \* a map of file_id -> one or more file slices
+          fg_key_mapping  \* a map of key -> file_id
 
 ASSUME FileGroupCount \in Nat
-ASSUME EnableFgMappingConflictCheck \in BOOLEAN
+ASSUME PrimaryKeyConflictCheck \in BOOLEAN
 
 fg_vars == << file_group, fg_key_mapping >>
 
@@ -18,18 +20,15 @@ fg_vars == << file_group, fg_key_mapping >>
 \* Types and definitions
 \* ------------------------------------------------------------------
 
-KvEntry ==
-    [key: Keys,
-     value: Values]
-
 BaseFileIdentifier ==
     [file_id: Nat,
      file_write_token: Nat,
-     commit_ts: Nat]
+     commit_ts: Nat,
+     salt: Nat]
 
 BaseFile ==
     [base_file_id: BaseFileIdentifier,
-     entries: SeqOf(KvEntry, Cardinality(Keys))]
+     entries: [Keys -> Values]]
 
 \* ------------------------------------------------------------------
 \* Init
@@ -41,10 +40,6 @@ FgInit(keys) ==
                             [x \in {} |-> Nil]]
     \* no key-fg mappings yet
     /\ fg_key_mapping = [k \in {} |-> 0]
-
-
-FgUnchanged ==
-    UNCHANGED << file_group, fg_key_mapping >>
 
 \* ------------------------------------------------------------------
 \* HELPER: File group CRUD
@@ -61,51 +56,50 @@ FileGroupLookup(key) ==
     THEN Nil
     ELSE fg_key_mapping[key]
 
-FgMappingConflict(key, fg) ==
-    /\ EnableFgMappingConflictCheck
+PrimaryKeyConflict(key, fg) ==
+    /\ PrimaryKeyConflictCheck
     /\ key \in DOMAIN fg_key_mapping
     /\ fg_key_mapping[key] # fg
 
 CommitKeyFileGroupMapping(key, fg) ==
-    IF key \in DOMAIN fg_key_mapping
-    THEN \* if this happens then something went wrong as we're 
-         \* orphaning previously written keys by repointing the
-         \* mapping to a different file group
-         fg_key_mapping' = [fg_key_mapping EXCEPT ![key] = fg]
-    ELSE fg_key_mapping' = fg_key_mapping @@ (key :> fg)    
+    /\ IF key \in DOMAIN fg_key_mapping
+       THEN \* if this happens then primary key conflict detection 
+            \* must be disabled. This will orphan a previously written
+            \* key by repointing the mapping to a different file group.
+            fg_key_mapping' = [fg_key_mapping EXCEPT ![key] = fg]
+       ELSE fg_key_mapping' = fg_key_mapping @@ (key :> fg)
+    /\ UNCHANGED << file_group >>
     
-LoadFileSlice(file_id, ts) ==
+LoadFileSlice(file_id, ts, salt) ==
     LET fs_id == CHOOSE fs_id \in DOMAIN file_group[file_id] :
-                    fs_id.commit_ts = ts
+                    /\ fs_id.commit_ts = ts
+                    /\ fs_id.salt = salt
     IN file_group[file_id][fs_id]
+
+FileSliceAbsentOrNotSupported(file_id, file_slice_id) ==
+    \/ ~PutIfAbsentSupported
+    \/ file_slice_id \notin DOMAIN file_group[file_id]
 
 PutFileSlice(file_id, file_slice_id, file_slice) ==
     /\ IF file_slice_id \in DOMAIN file_group[file_id]
        THEN file_group' = [file_group EXCEPT ![file_id][file_slice_id] = file_slice]
        ELSE file_group' = [file_group EXCEPT ![file_id] =
                                @ @@ (file_slice_id :> file_slice)]
-    /\ UNCHANGED fg_key_mapping
+    /\ UNCHANGED << fg_key_mapping >>
 
 \* ---------------------------------------------
 \* HELPER: Merge file slice entries (in-memory)
 \* ---------------------------------------------
 
 EmptyEntries ==
-    [k \in {} |-> <<>>]
+    [k \in {} |-> Nil]
 
-ApplyInsertToFileEntries(entries, op) ==
+ApplyUpsertToFileEntries(entries, op) ==
     IF Cardinality(DOMAIN entries) = 0
-    THEN (op.key :> <<op.value>>)
+    THEN (op.key :> op.value)
     ELSE IF \E key \in DOMAIN entries : key = op.key
-            THEN [entries EXCEPT ![op.key] = Append(@, op.value)]
-            ELSE entries @@ (op.key :> <<op.value>>) 
-
-ApplyUpdateToFileEntries(entries, op) ==
-    IF Cardinality(DOMAIN entries) = 0
-    THEN (op.key :> <<op.value>>)
-    ELSE IF \E key \in DOMAIN entries : key = op.key
-            THEN [entries EXCEPT ![op.key] = <<op.value>>]
-            ELSE entries @@ (op.key :> <<op.value>>) 
+            THEN [entries EXCEPT ![op.key] = op.value]
+            ELSE entries @@ (op.key :> op.value) 
 
 ApplyDeleteToFileEntries(entries, op) ==
     IF Cardinality(DOMAIN entries) = 0
@@ -116,8 +110,8 @@ ApplyDeleteToFileEntries(entries, op) ==
 MergeFileEntries(fslice, op) ==
     LET entries == IF fslice = Nil THEN EmptyEntries ELSE fslice.entries
     IN
-        CASE op.type = Insert -> ApplyInsertToFileEntries(entries, op)
-          [] op.type = Update -> ApplyUpdateToFileEntries(entries, op)
+        CASE \/ op.type = Insert
+             \/ op.type = Update -> ApplyUpsertToFileEntries(entries, op)
           [] OTHER -> ApplyDeleteToFileEntries(entries, op)
     
 ===================================================    
