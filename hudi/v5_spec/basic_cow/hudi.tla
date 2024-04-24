@@ -195,7 +195,7 @@ AppendRequestedToTimeline(w) ==
                /\ UNCHANGED lock_vars 
           ELSE /\ Abort(w)
                /\ UNCHANGED timeline_vars
-    /\ UNCHANGED << key_index, table_lock, ts_vars, fg_vars, aux_vars >>
+    /\ UNCHANGED << key_index, ts_vars, fg_vars, aux_vars >>
 
 (* 
     ACTION: KeyLookup ---------------------------------
@@ -366,8 +366,7 @@ UpdateIndexes(w) ==
     \* enabling conditions
     /\ WriterInState(w, UpdateIndexPhase)
     /\ IF ConcurrencyControl = Optimistic
-       THEN /\ table_lock = Nil
-            /\ table_lock' = w \* acquire the lock
+       THEN table_lock = Nil
        ELSE TRUE
     \* state mutations
     /\ IF /\ writer[w].op.type = Insert
@@ -375,12 +374,13 @@ UpdateIndexes(w) ==
                                 writer[w].file_id)
        THEN /\ Abort(w)
             /\ UNCHANGED << key_index, fg_vars >>
-       ELSE /\ key_index' = key_index \union {writer[w].op.key}
+       ELSE /\ table_lock' = w \* acquire the lock
+            /\ key_index' = key_index \union {writer[w].op.key}
             /\ CommitKeyFileGroupMapping(writer[w].op.key, writer[w].file_id)
             /\ writer' = [writer EXCEPT ![w].phase = IF ConcurrencyControl = Optimistic
                                                      THEN OCC_Phase
                                                      ELSE CommitPhase]
-            /\ UNCHANGED lock_vars
+            /\ UNCHANGED fg_lock
     /\ UNCHANGED << timeline_vars, ts_vars, aux_vars >>
 
 (* 
@@ -411,8 +411,9 @@ OptimisticConcurrencyCheck(w) ==
                             writer[w].file_id,
                             orig_ts)
           THEN Abort(w)
-          ELSE writer' = [writer EXCEPT ![w].phase = CommitPhase]
-    /\ UNCHANGED << key_index, lock_vars, timeline_vars, ts_vars, fg_vars, aux_vars >>
+          ELSE /\ writer' = [writer EXCEPT ![w].phase = CommitPhase]
+               /\ UNCHANGED lock_vars
+    /\ UNCHANGED << key_index, timeline_vars, ts_vars, fg_vars, aux_vars >>
 
 (* 
     ACTION: AppendCommitToTimeline ------------------------
