@@ -1,5 +1,13 @@
 ----------------------------- MODULE delta_lake -----------------------------
 
+(* Author: Jack Vanlightly
+
+This specification is based on a subset of the Delta Lake protocol
+(https://github.com/delta-io/delta/blob/master/PROTOCOL.md).
+
+See the readme.md for notes and instructions.
+*)
+
 EXTENDS Integers, Naturals, FiniteSets, FiniteSetsExt, Sequences, TLC
 
 \* Model parameters
@@ -126,6 +134,17 @@ DeltaLogPut(log_entry_id, contents) ==
     ELSE \* add
          delta_log' = delta_log @@ (log_entry_id :> contents)    
 
+IsLiveDataFile(f, partition, dlog) ==
+    (* Determines if this data file exists in the current
+       table version the writer knows of. *)
+    \E id \in DOMAIN dlog :
+        /\ f \in dlog[id].added_files
+        /\ f.partition = partition
+        /\ ~\E id1 \in DOMAIN dlog :
+            /\ f \in dlog[id1].removed_files
+            /\ f.partition = partition
+            /\ id1 > id
+
 \* File helpers ------------------------------
 
 DataFiles ==
@@ -141,18 +160,6 @@ CurrentOrNewDataFiles ==
     IF PartitionByColumn1
     THEN [file_no: 0..aux_file_ctr, partition: Column1Values]
     ELSE [file_no: 0..aux_file_ctr, partition: {Nil}]
-
-IsLiveDataFile(f, partition, dlog) ==
-    (* Determines if this data file exists in the current
-       table version (the delta log loaded into memory of 
-       the writer). *)
-    \E id \in DOMAIN dlog :
-        /\ f \in delta_log[id].added_files
-        /\ f.partition = partition
-        /\ ~\E id1 \in DOMAIN dlog :
-            /\ f \in delta_log[id1].removed_files
-            /\ f.partition = partition
-            /\ id1 > id
 
 \* -------------------------------------------
 \* Actions
@@ -364,7 +371,7 @@ WriteDataFiles(w) ==
     ACTION: CoordinatePrepareWrite ------------------
     
     The writer is in the VersionCheckPhase because 
-    UseCoordination=TRUE and the read phase has completed.
+    UseCoordination=TRUE and the write phase has completed.
     The writer acquires a table lock and loads the delta 
     log. If it finds a log entry with a higher entry id 
     than its own commit version (read version + 1 of its
@@ -504,16 +511,18 @@ ValidDeltaLog ==
 \* and deletes use col1 as the target.
 \* Once a KV pair has been written at a given version, subsequent
 \* reads at that version should return the same value. Reads at
-\* later version should read this value unless it gets overwritten 
-\* by a different value (or deleted) with a higher version.
+\* later version should also read this value, unless a later operation
+\* with a higher version updates the value or deletes the row entirely.
 \* Duplicates are possible as there are no primary keys, so it is
 \* possible to insert two rows with identical values. Duplicates
 \* do not violate consistency, and if two inserts of the same row
 \* occur, consistency rules mean that both rows should be readable.
 
 IsRelevantDataFile(f, partition, version) ==
-    (* Is the data file readable at this version *)
-    \* 1. Partition match
+    (* True, if the data file is readable at this version. I.e. it
+       is one of the data files of a snapshot that a reader would build
+       from this version of the table. *)
+    \* 1. The file has a matching partition
     /\ f.partition = partition
     \* 2. There is a log entry that references it in its added_files. 
     /\ \E id \in DOMAIN delta_log :
@@ -526,9 +535,9 @@ IsRelevantDataFile(f, partition, version) ==
             /\ id1 > id
 
 ValidValueReadable(col1_value, version, col2_values) ==
-    (* A delta log entry references a relevant data file 
-       (a data file that is relevant for the given version) 
-       that contains a row with matching col1 and col2 values. *)
+    (* For each of the expected rows (col1_value and col2_values set),
+       there exists a relevant delta log entry that references a data file 
+       that contains the row. *)
     \A col2_value \in col2_values :
         \E id \in DOMAIN delta_log :
             /\ id <= version
@@ -539,9 +548,8 @@ ValidValueReadable(col1_value, version, col2_values) ==
                     /\ row[2] = col2_value
 
 NoInvalidValueReadable(col1_value, version, col2_values) ==
-    (* There is no delta log entry that references a relevant data file 
-       (a data file that is relevant for the given version) that contains 
-       this col1 value but has a different col2 value. *)
+    (* There is no relevant delta log entry that references a data file 
+       that contains a non-matching row. *)
     ~\E id \in DOMAIN delta_log :
         /\ id <= version
         /\ \E f \in delta_log[id].added_files :
@@ -551,9 +559,8 @@ NoInvalidValueReadable(col1_value, version, col2_values) ==
                 /\ row[2] \notin col2_values
               
 ReadIsNil(col1_value, version) ==
-    (* There is no delta log entry that references a relevant data file 
-       (a data file that is relevant for the given version) that has 
-       a row with this col1 value.*)
+    (* There is no relevant delta log entry that references a data file 
+       that contains a row with this column1 value.*)
     ~\E id \in DOMAIN delta_log :
         /\ id <= version
         /\ \E f \in delta_log[id].added_files :
@@ -563,7 +570,7 @@ ReadIsNil(col1_value, version) ==
 RECURSIVE ModelReadRow(_,_,_,_)
 ModelReadRow(i, seq, version, values) ==
     (* Read the serialized history of transactions of this key (col1),
-       in order, and determine the final rows which a read should return. *)
+       in order, and determine the final rows that a read should return. *)
     CASE i > Len(seq) -> values
       [] seq[i].version <= version ->
             CASE seq[i].txn.op_type = Delete ->
@@ -576,19 +583,20 @@ ModelReadRow(i, seq, version, values) ==
                     ModelReadRow(i+1, seq, version, values)
       [] OTHER -> ModelReadRow(i+1, seq, version, values)
 
-ModelRead(col1_value, version) ==
+LinearizedHistoryRead(col1_value, version) ==
     ModelReadRow(1, aux_kv_log[col1_value], version, {})
 
 ConsistentRead ==
     \A col1_value \in Column1Values, version \in 1..CurrentVersion(delta_log) :
-        LET model_col2_values == ModelRead(col1_value, version)
-        IN IF model_col2_values = {}
-           THEN \* No rows should be readable
+        LET expected_col2_values == LinearizedHistoryRead(col1_value, version)
+        IN IF expected_col2_values = {} \* If no rows in model read
+           THEN \* Then no rows should be readable based on delta log and data files
                 ReadIsNil(col1_value, version)
-           ELSE \* All the rows of the model read should be readable
-                /\ ValidValueReadable(col1_value, version, model_col2_values)
-                \* No rows other rows should be readable
-                /\ NoInvalidValueReadable(col1_value, version, model_col2_values)
+           ELSE \* Else, all the rows of the model read should be readable 
+                /\ ValidValueReadable(col1_value, version, expected_col2_values)
+                \* and no rows other rows should be readable in the data files that do
+                \* not match the model read.
+                /\ NoInvalidValueReadable(col1_value, version, expected_col2_values)
 
 \* INV: TestInv -------------------------------------
 \* For debugging
