@@ -1,0 +1,1143 @@
+# Apache Paimon fizzbee spec -----------------------------
+# Author: Jack Vanlightly
+# Based on the 0.8 version.
+#
+# Models multiple writers, compactions and deletion vectors.
+
+# See the README.md for a description of the spec.
+
+# CONSTANTS ---------------------------------
+
+NUM_WRITERS = 2                     # The number of writers
+NUM_COMPACTORS = 2                  # The number of compactors
+NUM_PARTITIONS = 1                  # The number of partitions
+NUM_BUCKETS = 2                     # The number of buckets per partition
+MAX_LEVEL = 2                       # The max depth of an LSM tree
+PUT_IF_ABSENT = True                # Object store supports PutIfAbsent
+USE_LOCK = False                    # The metadata commit uses a lock (necessary without PutIfAbsent)
+DV_ENABLED = True                   # Deletion vectors enabled
+ONE_WRITER_PER_BUCKET = True        # Each bucket is only written to by one writer.
+                                    # When false, all writers can write to all buckets.
+
+# State space limiting constants
+STREAMING_SINK = False              # Determines whether updates are streaming sink or read/modify/write style.
+ALLOW_UPDATES = True                # Include update queries
+ALLOW_DELETES = False               # Include delete queries
+MAX_WRITE_OPS = 3                   # The max number of write operations
+MAX_WRITE_OPS_PER_KEY = 2           # The max number of write operations per primary key
+MAX_WRITE_OPS_PER_WRITER = 2        # The max number of write operations per writer
+MAX_COMPACTIONS = 2                 # The max number of compactions
+MAX_COMPACTIONS_PER_COMPACTOR = 2   # The max number of compactions per compactor
+
+# The primary keys and non-primary key col values
+PkCol1Values = ['jack'  ]
+Col2Values = ['red', 'blue', 'green']
+Col3Values = ['A']
+
+# Enums
+State = enum('READY', 'WRITE_DATA_FILES', 'WRITE_METADATA_FILES',
+             'PREPARE_COMMIT', 'COMMIT', 'FAILED', 'BAD_STATE')
+CommitKind = enum('APPEND', 'COMPACT')             
+OpType = enum('INSERT', 'UPDATE', 'DELETE')
+FileKind = enum('ADD', 'DELETE')
+ReturnCode = enum('ALREADY_EXISTS', 'NO_FILE', 'OK')
+
+# ----------------------------------------------
+# Common functions 
+# ----------------------------------------------
+
+atomic func DataFileNamePrefix(partition, bucket):
+    return 'p-' + str(partition) + '_b-' + str(bucket) + '_data-'
+
+atomic func DataFileName(partition, bucket):
+    prefix = DataFileNamePrefix(partition, bucket)
+    name = prefix + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func DvFileName(partition, bucket):
+    name = 'p-' + str(partition) + '_b-' + str(bucket) + '_dv-' + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func ManifestFileName():
+    name = 'manifest-' + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func ManifestListFileName():
+    name = 'manifestlist-' + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func IndexManifestFileName():
+    name = 'index-' + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func TmpSnapshotFileName():
+    name = 'tmp-snapshot-' + str(aux_file_id)
+    aux_file_id += 1
+    return name
+
+atomic func SnapshotFileName(version):
+    return 'snapshot-' + str(version)
+
+atomic func AuxLogCommit(version, op_row, aux_col_mask):
+    # Logs the row and the target columns changed. The column
+    # mask tells us which columns were changed vs left unchanged.
+    # This linearized history is used by the consistency check.
+
+    # The spec maintains info about which keys can be inserted
+    if op_row[1] == '-D':
+        if op_row[2] in aux_key_insert_pending:
+            aux_key_insert_pending.remove(op_row[2])
+
+    # Add an entry for this pk in the model
+    pk = op_row[2]
+    if pk not in aux_key_col_log:
+        aux_key_col_log[pk] = dict()
+
+    # Log each column value in the model
+    for col in range(3, 5):
+        if col not in aux_key_col_log[pk]:
+            aux_key_col_log[pk][col] = list()
+
+        if aux_col_mask[col] == True:
+            rec = None
+            if op_row[1] == '-D':
+                rec = record(version = version, value = None)
+            else:
+                rec = record(version = version, value = op_row[col])
+            aux_key_col_log[pk][col].append(rec)
+
+atomic func GetManifestEntries(base_manifest_list,
+                               delta_manifest_list, 
+                               prefix):
+    # Returns the manifest entries oif the manifest files listed
+    # in the two manifest list files, with a prefix file name filter.
+    manifest_list = base_manifest_list + delta_manifest_list
+
+    entries = list()
+    for manifest_id in manifest_list:
+        manifest = object_store.Read(manifest_id)
+        for entry in manifest.entries:
+            entries.append(entry)
+
+    return entries
+
+atomic func MergeManifestEntries(entries):
+    # Merges a list of manifest entries (from multiple manifest files)
+    # removing entries which have an ADD and a corresponding DELETE.
+    # Each entry corresponds to a single data file.
+    merged_entries = list()
+    
+    for entry in entries:
+        if entry.kind == FileKind.ADD:
+            merged_entries.append(entry)
+        elif entry.kind == FileKind.DELETE:
+            # If there's a corresponds ADD entry, then remove it
+            # as the DELETE cancels the ADD
+            add_existed = False
+            for index in range(len(merged_entries)):
+                if merged_entries[index].file_id == entry.file_id:
+                    merged_entries.pop(index)
+                    add_existed = True
+                    break
+            # Else add the DELETE entry, which has no corresponding ADD
+            if not add_existed:
+                merged_entries.append(entry)
+
+    return merged_entries
+
+atomic func FilesOfManifestEntries(entries):
+    data_file_ids = list()
+    
+    for entry in entries:
+        data_file_ids.append(entry.file_id)
+
+    return data_file_ids
+
+atomic func MergeRowsOfDataFiles(pk, data_file_ids, dv_file):
+    # Performs a merge/"DV filter" of multiple data files,
+    # for only a single primary key value.
+    last = None
+    for file_id in data_file_ids:
+        data_file = object_store.Read(file_id)
+        index = -1
+        for row in data_file.rows:
+            index += 1
+            if file_id in dv_file.dvectors:
+                if index in dv_file.dvectors[file_id]:
+                    continue
+
+            if row[2] == pk:
+                if last == None:
+                    last = row
+                elif row[0] > last[0]:
+                    last = row
+    
+    if last == None:
+        return None
+    elif last[1] == '-D':
+        return None
+    else:
+        return last
+
+atomic func ListDataFilesOfVersion(partition, bucket, version):
+    # Returns a list of data file ids of the specified partition,
+    # bucket and version. Loads the snapshot, then reads the manifest
+    # list files, manifest file entries to get the data file ids.
+    prefix = DataFileNamePrefix(partition, bucket)
+    data_file_ids = list()
+
+    snapshot_id = SnapshotFileName(version)
+    snapshot = object_store.Read(snapshot_id)
+    if snapshot == None:
+        return data_file_ids
+
+    base_manifest_list = object_store.Read(snapshot.base_manifest_list)
+    delta_manifest_list = object_store.Read(snapshot.delta_manifest_list)
+
+    all_entries = GetManifestEntries(base_manifest_list,
+                                     delta_manifest_list, 
+                                     prefix)
+    merged_entries = MergeManifestEntries(all_entries)
+    file_ids = FilesOfManifestEntries(merged_entries)
+    return file_ids
+    
+
+atomic func LookupRowInLSM(partition, bucket, version, pk, dv_file):
+    # Performs a lookup against the bucket LSM in the object store.
+    # It determines the data files that match and performs a merge
+    # to return the correct row.
+    data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+
+    if len(data_file_ids) == 0:
+        return None
+                    
+    row = MergeRowsOfDataFiles(pk, data_file_ids, dv_file)
+    if row != None and row[1] == '-D':
+        return None
+
+    return row
+
+atomic func LatestSnapshotVersion():
+    snapshots = object_store.List("snapshot")
+    lastest_version = len(snapshots)
+    return lastest_version
+
+atomic func ReadSnapshotFile(version):
+    if version == 0:
+        return None
+
+    snapshot_id = SnapshotFileName(version)
+    snapshot = object_store.Read(snapshot_id)
+    return snapshot    
+
+atomic func LookupDvFileOf(partition, bucket, version):
+    # Returns the DV file of the specified partition, bucket and version.
+    dv = record(id = None, dvectors = dict())
+    if not DV_ENABLED:
+        return dv
+
+    curr_dv_id = None
+
+    # Read the latest snapshot
+    snapshot_file_id = SnapshotFileName(version)
+    exists = object_store.Exists(snapshot_file_id)
+    if not exists:
+        return dv
+
+    snapshot = object_store.Read(snapshot_file_id)
+
+    # If the snapshot has an index file, then obtain the DV file id from it.
+    if snapshot.index_manifest != None:
+        index_manifest = object_store.Read(snapshot.index_manifest)
+        if partition in index_manifest:
+            if bucket in index_manifest[partition]:
+                curr_dv_id = index_manifest[partition][bucket]
+
+    # If it found a DV file id, read the file from the object store
+    if curr_dv_id != None:
+        dv = object_store.Read(curr_dv_id)
+        
+    return dv
+
+atomic func LookupDvFileOfLatest(partition, bucket):
+    lastest_version = LatestSnapshotVersion()
+    dv = LookupDvFileOf(partition, bucket, lastest_version)
+    return dv
+
+atomic func ReadColFromModel(version, pk, col):
+    # Performs a read against the linearized history variable,
+    # and returns the expect column value based on the provided
+    # version.
+    if pk not in aux_key_col_log:
+        return None
+
+    if col not in aux_key_col_log[pk]:
+        return None
+    
+    value = None
+    for entry in aux_key_col_log[pk][col]:
+        if entry.version <= version:
+            value = entry.value
+        else:
+            break
+
+    return value
+
+atomic func AuxPkExists(pk):
+    # Used by the spec to artificially constrain the model to operations
+    # where the primary key must have been previously committed.
+    lastest_version = LatestSnapshotVersion()
+    read = ReadColFromModel(lastest_version, pk, 3) # read column 2
+
+    return read != None
+
+# ----------------------------------------------
+# WRITER instance role
+# All actions are driven by the writer instances.
+# Each writer instance can have a writer and/or compactor.
+# ----------------------------------------------
+role Writer:
+
+    atomic action Init:
+        # The primary keys and buckets mapped to this writer (to set up a given topology)
+        self.assignments = list() 
+
+        self.sequence_no = 0
+        self.compact_ctr = 0
+        write_op = self.ResetWriteOpState()
+        self.write_op = write_op
+        compact_op = self.ResetCompactionState()
+        self.compact_op = compact_op
+        self.is_writer = self.ID < NUM_WRITERS
+        self.is_compactor = self.ID < NUM_COMPACTORS
+
+    atomic func ResetWriteOpState():
+        return record(state = State.READY,
+                      commit_kind = CommitKind.APPEND,
+                      op_type = None,
+                      bucket = None,
+                      partition = None,
+                      op_row = None,
+                      aux_col_mask = None,
+                      data_file_id = None,
+                      data_file = None,
+                      delete_file_ids = None, # not used in write ops
+                      tmp_snapshot_file_id = None,
+                      snapshot_version = None,
+                      snapshot_file = None,
+                      metadata_files = set(),
+                      holds_lock = False)
+
+    atomic func ResetCompactionState():
+        return record(state = State.READY,
+                      commit_kind = CommitKind.COMPACT,
+                      level = None,
+                      dv_file = None,
+                      dv_file_id = None,
+                      data_file_id = None,
+                      data_file = None,
+                      delete_file_ids = None,
+                      tmp_snapshot_file_id = None,
+                      snapshot_version = None,
+                      snapshot_file = None,
+                      metadata_files = set(),
+                      holds_lock = False)
+
+    atomic func ResetOp(op):
+        if op.commit_kind == CommitKind.APPEND:
+            write_op = self.ResetWriteOpState()
+            self.write_op = write_op
+        else:
+            compact_op = self.ResetCompactionState()
+            self.compact_op = compact_op
+
+    atomic func SetOp(op):
+        if op.commit_kind == CommitKind.APPEND:
+            self.write_op = op
+        else:
+            self.compact_op = op
+
+    atomic func AssignPk(pk, partition, bucket):
+        # Used during Init to map PK and bucket to writers. Not part of Paimon directly.
+        rec = record(pk = pk, partition = partition, bucket = bucket)
+        self.assignments.append(rec)
+
+    atomic func SetOpState(partition, bucket, pk, op_type):
+        self.write_op.op_type = op_type
+        self.write_op.partition = partition
+        self.write_op.bucket = bucket
+        self.write_op.state = State.WRITE_DATA_FILES
+
+    atomic func DoLookup(partition, bucket, pk, dv_file):
+        snapshots = object_store.List("snapshot")
+        lastest_version = len(snapshots)
+
+        if lastest_version == 0:
+            return None
+
+        row = LookupRowInLSM(partition, bucket, lastest_version, pk, dv_file)
+        return row
+    
+    atomic func ClearMetadataFiles(op):
+        for fid in op.metadata_files:
+            object_store.Delete(fid)
+
+        op.metadata_files = set()
+
+    atomic fair action StartInsertOperation:
+        require self.is_writer and self.write_op.state == State.READY
+        require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
+
+        any assignment in self.assignments:
+            pk = assignment.pk
+            partition = assignment.partition
+            bucket = assignment.bucket
+                
+            # Constrain the spec to only try to insert any given PK once and one at a time.
+            exists = AuxPkExists(pk)
+            require not exists and pk not in aux_key_insert_pending
+                
+            col2 = any Col2Values
+            col3 = any Col3Values
+            
+            # A row is an array of 5 elements: Seq no, RowKind, PK, Col2, Col3.
+            self.write_op.op_row = [self.sequence_no, '+I', pk, col2, col3]
+            # aux_col_mask is used to build a linearized history for consistency checking
+            self.write_op.aux_col_mask = [True, True, True, True, True]
+            self.SetOpState(partition, bucket, pk, OpType.INSERT)
+            self.sequence_no += 1
+            aux_op_count += 1
+            aux_key_insert_pending.add(pk)
+            aux_pk_ops[pk] = 1
+    
+    atomic fair action StartDeleteOperation:
+        require ALLOW_DELETES and self.is_writer and self.write_op.state == State.READY 
+        require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
+
+        any assignment in self.assignments:
+            pk = assignment.pk
+            partition = assignment.partition
+            bucket = assignment.bucket
+            require aux_pk_ops[pk] < MAX_WRITE_OPS_PER_KEY
+
+            # Constrain the spec to only try to delete a PK that was previously 
+            # committed. The writer doesn't actually do this check,
+            # its just to constrain the model checker.
+            exists = AuxPkExists(pk)
+            require exists
+            
+            self.op_row = [self.sequence_no, '-D', pk]
+            self.aux_col_mask = [True, True, True, True, True]
+            self.SetOpState(partition, bucket, pk, OpType.DELETE)
+            self.sequence_no += 1
+            aux_op_count += 1
+            aux_pk_ops[pk] = aux_pk_ops[pk] + 1
+
+    atomic fair action StartReadModifyUpdateOperation:
+        require ALLOW_UPDATES and STREAMING_SINK == False
+        require self.is_writer and self.write_op.state == State.READY 
+        require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
+
+        # This is a read, modify, write operation. Only a single non-PK column
+        # gets updated, and the other remains unchanged. The column mask is
+        # used to mark which columns were changed. This is used by the consistency
+        # safety property to check for lost updates.
+        any assignment in self.assignments:
+            pk = assignment.pk
+            partition = assignment.partition
+            bucket = assignment.bucket
+            require aux_pk_ops[pk] < MAX_WRITE_OPS_PER_KEY
+            
+            # Read
+            dv_file = LookupDvFileOfLatest(partition, bucket)
+            row = self.DoLookup(partition, bucket, pk, dv_file)
+            require row != None
+
+            # Modify
+            self.write_op.aux_col_mask = [False, False, False, False, False]
+            col2 = None
+            col3 = None
+
+            oneof:
+                atomic:
+                    x = any Col2Values
+                    col2 = x # workaround for modelchecker bug
+                    self.write_op.aux_col_mask[3] = True
+                    col3 = row[4] # don't change the column value
+                atomic:
+                    col2 = row[3] # don't change the column value
+                    self.write_op.aux_col_mask[4] = True
+                    x = any Col3Values
+                    col3 = x # workaround for modelchecker bug
+
+            self.write_op.op_row = [self.sequence_no, '+U', pk, col2, col3]
+            self.SetOpState(partition, bucket, pk, OpType.UPDATE)
+            self.sequence_no += 1
+            aux_op_count += 1
+            aux_pk_ops[pk] = aux_pk_ops[pk] + 1
+
+    atomic fair action StartStreamingSinkUpdateOperation:
+        require ALLOW_UPDATES and STREAMING_SINK == True
+        require self.is_writer and self.write_op.state == State.READY 
+        require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
+        
+        # This is a write operation where the table is not the source
+        # of truth and updates simply overwrite the whole row (such as
+        # in a streaming sink).
+        any assignment in self.assignments:
+            pk = assignment.pk
+            partition = assignment.partition
+            bucket = assignment.bucket
+            require aux_pk_ops[pk] < MAX_WRITE_OPS_PER_KEY
+                            
+            # Constrain the spec to only try to update a PK that was  
+            # previously committed. The writer doesn't actually do this check,
+            # its just to constrain the model checker.
+            exists = AuxPkExists(pk)
+            require exists
+                
+            self.write_op.aux_col_mask = [False, False, False, True, True]
+            x = any Col2Values
+            col2 = x # workaround for modelchecker bug
+            x = any Col3Values
+            col3 = x # workaround for modelchecker bug
+
+            self.write_op.op_row = [self.sequence_no, '+U', pk, col2, col3]
+            self.SetOpState(partition, bucket, pk, OpType.UPDATE)
+            self.sequence_no += 1
+            aux_op_count += 1
+                
+            aux_pk_ops[pk] = aux_pk_ops[pk] + 1
+
+    atomic fair action StartCompaction:
+        require self.is_compactor and self.compact_op.state == State.READY
+        require aux_compact_count < MAX_COMPACTIONS and self.compact_ctr < MAX_COMPACTIONS_PER_COMPACTOR
+        
+        any assignment in self.assignments:
+            # Artificially constrain the spec to only do compaction of a level
+            # when there are files to compact.
+            levels = set()
+            version = LatestSnapshotVersion()
+            data_file_ids = ListDataFilesOfVersion(assignment.partition, assignment.bucket, version)
+            
+            for data_file_id in data_file_ids:
+                data_file = object_store.Read(data_file_id)
+                if data_file.level < MAX_LEVEL:
+                    levels.add(data_file.level)
+
+            require len(levels) > 0
+
+            # Non-deterministically choose a level to compact
+            any level in levels:
+                self.compact_op.partition = assignment.partition
+                self.compact_op.bucket = assignment.bucket
+                self.compact_op.level = level
+                self.compact_op.state = State.WRITE_DATA_FILES
+                self.compact_ctr += 1
+                aux_compact_count += 1
+
+    atomic fair action WriteDataFilesAsWriter:
+        # This spec models a single row operation, so only one 
+        # data file is written.
+        require self.write_op.state == State.WRITE_DATA_FILES
+
+        op = self.write_op
+                
+        # Write a new data file -------------------------------
+        fid = DataFileName(op.partition, op.bucket)
+        op.data_file_id = fid
+        op.data_file = record(level = 0, rows = [op.op_row]) 
+
+        object_store.Write(fid, op.data_file)
+        op.state = State.WRITE_METADATA_FILES
+        self.SetOp(op)
+
+    atomic fair action WriteDataFilesAsCompactor:
+        # This spec models a single level compaction
+        require self.compact_op.state == State.WRITE_DATA_FILES
+
+        op = self.compact_op
+
+        # Load the data files of current snapshot of the target level
+        version = LatestSnapshotVersion()
+        snapshot = ReadSnapshotFile(version)
+        dv_file = LookupDvFileOf(op.partition, op.bucket, version)
+        data_file_ids = ListDataFilesOfVersion(op.partition, op.bucket, version)
+        
+        data_files = list()
+        source_file_ids = list()
+        for data_file_id in data_file_ids:
+            data_file = object_store.Read(data_file_id)
+            if data_file.level == op.level:
+                data_files.append(data_file)
+                source_file_ids.append(data_file_id)
+        
+        # Do an equivalent of a multiway merge. For simplicity, it
+        # reuses the PK scoped merge used by key lookup.
+        final_rows = list()
+        updated_keys = set()
+        for pk in PkCol1Values:
+            row = MergeRowsOfDataFiles(pk, data_file_ids, dv_file)
+            if row != None:
+                if DV_ENABLED and (row[1] == '-D' or row[1] == '+U'):
+                    updated_keys.add(row[2])
+
+                if not DV_ENABLED or (DV_ENABLED and row[1] != '-D'):
+                    # drop deletes when using DV
+                    final_rows.append(row)
+
+        # Write a new data file -------------------------------
+        new_level = op.level + 1
+        fid = DataFileName(op.partition, op.bucket)
+        op.data_file_id = fid
+        op.data_file = record(level = new_level, rows = final_rows)
+        op.delete_file_ids = source_file_ids
+
+        object_store.Write(fid, op.data_file)
+
+        # May update deletion vectors -----------------------------
+        if DV_ENABLED and len(updated_keys) > 0:
+            # Get the current DV file, if any, update it and write it back.
+            lastest_version = LatestSnapshotVersion()
+
+            # Get the data file ids of the bucket
+            data_file_ids = list()
+            if (lastest_version > 0):
+                snapshot = ReadSnapshotFile(lastest_version)
+                prefix = DataFileNamePrefix(op.partition, op.bucket)
+                base_manifest_list = object_store.Read(snapshot.base_manifest_list)
+                delta_manifest_list = object_store.Read(snapshot.delta_manifest_list)
+                all_entries = GetManifestEntries(base_manifest_list,
+                                                 delta_manifest_list, 
+                                                 prefix)
+                merged_entries = MergeManifestEntries(all_entries)
+                data_file_ids = FilesOfManifestEntries(merged_entries)
+                            
+            # Update the DV file. Only check data files in higher levels than the compaction.
+            for data_file_id in data_file_ids:
+                data_file = object_store.Read(data_file_id)
+                if data_file.level > op.level:
+                    index = 0
+                    for drow in data_file.rows:
+                        if drow[2] in updated_keys:
+                            if data_file_id not in dv_file.dvectors:
+                                dv_file.dvectors[data_file_id] = set()    
+                            if index not in dv_file.dvectors[data_file_id]:
+                                dv_file.dvectors[data_file_id].add(index)
+                        index += 1
+
+            # Write it as a new DV file
+            dv_file_id = DvFileName(op.partition, op.bucket)
+            op.dv_file_id = dv_file_id
+            op.dv_file = dv_file
+            object_store.Write(op.dv_file_id, op.dv_file)
+        
+        op.state = State.WRITE_METADATA_FILES
+        self.SetOp(op)
+
+    atomic fair action WriteMetadataFiles:
+        any op in [self.write_op, self.compact_op]:
+            require op.state == State.WRITE_METADATA_FILES
+            
+            # Get the latest snapshot -----------------------
+            lastest_version = LatestSnapshotVersion()
+            latest_snapshot = ReadSnapshotFile(lastest_version)
+
+            # Write the manifest file of the new/removed data files ----------
+            manifest_file_id = ManifestFileName()
+            manifest_file_entries = list()
+            add_entry = record(kind = FileKind.ADD, file_id = op.data_file_id)
+            manifest_file_entries.append(add_entry)
+                        
+            if op.delete_file_ids != None:
+                for del_file_id in op.delete_file_ids:
+                    del_entry = record(kind = FileKind.DELETE, file_id = del_file_id)
+                    manifest_file_entries.append(del_entry)
+
+            manifest_file = record(entries = manifest_file_entries, 
+                                   partition = op.partition, 
+                                   bucket = op.bucket)
+            
+            object_store.Write(manifest_file_id, manifest_file)
+            op.metadata_files.add(manifest_file_id)
+            
+            # Create delta manifest list file -----------------------
+            delta_ml_file_id = ManifestListFileName()
+            delta_ml_file = [manifest_file_id]
+            object_store.Write(delta_ml_file_id, delta_ml_file)
+            op.metadata_files.add(delta_ml_file_id)
+                        
+            # Create base manifest list file -----------------------
+            # this includes compaction of the metadata manifest files
+            # (not the data files).
+            base_ml_file_id = ManifestListFileName()
+            base_ml_file = list()
+
+            if latest_snapshot != None:
+                # Do a compaction of the previous base and delta manifest list
+                # and manifest files. This includes removing any manifest file entries
+                # (each entry points to a data file) that have an ADD then DELETE.
+                prev_base = object_store.Read(latest_snapshot.base_manifest_list)
+                prev_delta = object_store.Read(latest_snapshot.delta_manifest_list)
+                all_entries = GetManifestEntries(prev_base, prev_delta, "")
+                merged_entries = MergeManifestEntries(all_entries)
+
+                # Check for file deletion conflict
+                if op.commit_kind == CommitKind.COMPACT:
+                    combined_entries = merged_entries + manifest_file.entries
+                    combined_merged_entries = MergeManifestEntries(combined_entries)
+                    
+                    for entry in combined_merged_entries:
+                        if entry.kind == FileKind.DELETE:
+                            # Abort! Conflict between compactions. One of the files that
+                            # the compaction wants to logically delete is already logically deleted.
+                            self.ResetOp(op)
+                            return
+
+                # Create a new compacted manifest file (this spec just compacts
+                # everything into a single manifest file for simplicity).
+                compacted_manifest_file_id = ManifestFileName()
+                compacted_manifest_file = record(entries = merged_entries, 
+                                                 partition = op.partition, 
+                                                 bucket = op.bucket)
+            
+                object_store.Write(compacted_manifest_file_id, compacted_manifest_file)
+                op.metadata_files.add(compacted_manifest_file_id)
+                base_ml_file = [compacted_manifest_file_id]
+            
+            object_store.Write(base_ml_file_id, base_ml_file)
+            op.metadata_files.add(base_ml_file_id)
+            
+            # Create new index manifest file if DV changed ---------------
+            index_manifest_id = None
+            if latest_snapshot != None:
+                # If no new index manifest file is created, the new snapshot will 
+                # use the existing one.
+                index_manifest_id = latest_snapshot.index_manifest
+
+            if op.commit_kind == CommitKind.COMPACT and op.dv_file_id != None:
+                index_manifest = dict()
+                if latest_snapshot != None:
+                    # Load the current index manifest
+                    if latest_snapshot.index_manifest != None:
+                        index_manifest = object_store.Read(latest_snapshot.index_manifest)
+
+                # Update the index manifest with the new DV file (replacing any prior one for that bucket)
+                if op.partition not in index_manifest:
+                    index_manifest[op.partition] = dict()
+                    if op.bucket not in index_manifest[op.partition]:
+                        index_manifest[op.partition][op.bucket] = set()
+
+                index_manifest[op.partition][op.bucket] = op.dv_file_id
+
+                # Write the new index manifest file
+                index_manifest_id = IndexManifestFileName()
+                object_store.Write(index_manifest_id,
+                                index_manifest)
+
+            # Create snapshot file -----------------------
+            tmp = TmpSnapshotFileName()
+            op.tmp_snapshot_file_id = tmp
+            op.snapshot_version = lastest_version + 1
+            op.snapshot_file = record(version = op.snapshot_version,
+                                      base_manifest_list = base_ml_file_id,
+                                      delta_manifest_list = delta_ml_file_id,
+                                      index_manifest = index_manifest_id)
+            object_store.Write(op.tmp_snapshot_file_id,
+                            op.snapshot_file)
+            op.metadata_files.add(op.tmp_snapshot_file_id)
+                    
+            if USE_LOCK:
+                op.state = State.PREPARE_COMMIT
+            else:
+                op.state = State.COMMIT
+
+            self.SetOp(op)
+
+    atomic fair action PrepareCommit:
+        any op in [self.write_op, self.compact_op]:
+            require op.state == State.PREPARE_COMMIT
+                    
+            lock.AcquireLock(self.ID)
+            op.holds_lock = True
+
+            snapshot_file_id = SnapshotFileName(self.snapshot_version)
+            exists = object_store.Exists(snapshot_file_id)
+            if exists:
+                # Retry the commit, starting at the metadata file writing step
+                self.ClearMetadataFiles(op)
+                op.tmp_snapshot_file_id = None
+                op.snapshot_version = None
+                op.snapshot_file = None
+                op.state = State.WRITE_METADATA_FILES
+            else:
+                op.state = State.COMMIT
+
+            self.SetOp(op)
+    
+    atomic fair action Commit:
+        any op in [self.write_op, self.compact_op]:
+            require op.state == State.COMMIT
+
+            snapshot_file_id = SnapshotFileName(op.snapshot_version)
+            result = object_store.Rename(op.tmp_snapshot_file_id,
+                                        snapshot_file_id)
+            if op.holds_lock:
+                lock.FreeLock(self.ID)
+
+            if result == ReturnCode.OK:
+                if op.commit_kind == CommitKind.APPEND:
+                    AuxLogCommit(op.snapshot_version, op.op_row, op.aux_col_mask)
+                if op.snapshot_version > aux_max_version:
+                    aux_max_version = op.snapshot_version   
+                self.ResetOp(op)
+            elif result == ReturnCode.ALREADY_EXISTS:
+                # Retry the commit, starting at the metadata file writing step
+                self.ClearMetadataFiles(op)
+                op.tmp_snapshot_file_id = None
+                op.snapshot_version = None
+                op.snapshot_file = None
+                op.state = State.WRITE_METADATA_FILES
+                self.SetOp(op)
+            else:
+                op.state = State.BAD_STATE
+                self.SetOp(op)
+
+# ----------------------------------------------
+# LOCK role
+# ----------------------------------------------
+
+role Lock:
+    atomic action Init:
+        self.lock = None
+
+    atomic func AcquireLock(writer_id):
+        require self.lock == None
+        self.lock = writer_id
+
+    atomic func FreeLock(writer_id):
+        if self.lock == writer_id:
+            self.lock = None
+
+# ----------------------------------------------
+# OBJECT STORE role
+# ----------------------------------------------
+
+role ObjectStore:
+    atomic action Init:
+        # map of file id -> file
+        self.objects = dict()
+    
+    atomic func List(prefix):
+        matches = list()
+
+        for file_id in self.objects:
+            if file_id.startswith(prefix):
+                matches.append(file_id)
+
+        return matches
+
+    atomic func Exists(file_id):
+        if file_id in self.objects:
+            return True
+        else:
+            return False
+    
+    atomic func Read(file_id):
+        if file_id in self.objects:
+            return self.objects[file_id]
+        else:
+            return None
+
+    atomic func Delete(file_id):
+        if file_id in self.objects:
+            self.objects.pop(file_id)
+        return ReturnCode.OK
+    
+    atomic func Write(file_id, file):
+        if PUT_IF_ABSENT and file_id in self.objects:
+            return ReturnCode.ALREADY_EXISTS
+        else:
+            self.objects[file_id] = file
+            return ReturnCode.OK
+    
+    atomic func Rename(old_id, new_id):
+        if old_id not in self.objects:
+            return ReturnCode.NO_FILE
+
+        file = self.objects[old_id]
+        
+        if PUT_IF_ABSENT and new_id in self.objects:
+            return ReturnCode.ALREADY_EXISTS
+        else:
+            self.objects[new_id] = file
+            self.objects.pop(old_id)
+            return ReturnCode.OK
+
+# ----------------------------------------------
+# Safety properties
+# ----------------------------------------------
+
+always assertion TestInv:
+    # Used for debugging
+    return True
+
+always assertion NoBadState:
+    # If a writer ends up in a BAD_STATE, then something went wrong.
+    for w in writers:
+        if w.write_op.state == State.BAD_STATE:
+            print("INVARIANT VIOLATION! Writer op in bad state!")
+            return False
+        if w.compact_op.state == State.BAD_STATE:
+            print("INVARIANT VIOLATION! Compaction op in bad state!")
+            return False
+
+    return True
+
+always assertion SequentialSnapshotIds:
+    # There should be no gaps in the snapshot file numbering.
+    snapshot_ids = object_store.List("snapshot")
+    sorted(snapshot_ids)
+    for i in range(0, len(snapshot_ids)):
+        version = i + 1 # snapshot versions are 1-based
+        snapshot_id = SnapshotFileName(version)
+        if snapshot_ids[i] != snapshot_id:
+            print("INVARIANT VIOLATION! Non-sequential snapshots!")
+            return False
+
+    return True
+
+always assertion NoDanglingDeletionVector:
+    # Checks that all deletion vectors in all deletion vector files
+    # of each version, point to a data file that exists in that same version.
+    # If a deletion vector points to a file that no longer logically exists,
+    # it is a dangling deletion vector.
+    if DV_ENABLED:
+        for partition in range(NUM_PARTITIONS):
+            for bucket in range(NUM_BUCKETS):
+                for version in range(1, aux_max_version+1):
+                    data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+                    dv_file = LookupDvFileOf(partition, bucket, version)
+
+                    for file_id in dv_file.dvectors:
+                        if file_id not in data_file_ids:
+                            print("INVARIANT VIOLATION! Dangling deletion vector!")
+                            print("File ids of snapshot: " + str(data_file_ids))
+                            print("DV file: " + str(dv_file))
+                            return False
+
+    return True
+
+always assertion WithDeletionVectorsInLevels1PlusOnlyOneValidRowPerPk:
+    # Checks that for every primary key, in every version, in levels 1
+    # and above, that there do not exist two valid rows (not referred to
+    # in a DV file). This is violated when dangling DVs occur.
+    if DV_ENABLED:
+        for partition in range(NUM_PARTITIONS):
+            for bucket in range(NUM_BUCKETS):
+                for pk in bucket_pk_mapping[partition][bucket]:
+                    for version in range(1, aux_max_version+1):
+                        data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+                        dv_file = LookupDvFileOf(partition, bucket, version)
+
+                        pk_set = dict()
+                        for data_file_id in data_file_ids:
+                            data_file = object_store.Read(data_file_id)
+                            if data_file.level > 0:
+                                index = -1
+                                for row in data_file.rows:
+                                    index += 1
+
+                                    if data_file_id in dv_file.dvectors:
+                                        if index in dv_file.dvectors[data_file_id]:
+                                            continue
+
+                                    pk = row[2]
+                                    text = "PK: " + pk + ", data file: " + data_file_id + ", level: " + str(data_file.level) + ", pos: " + str(index)
+                                    if pk in pk_set:
+                                        print("INVARIANT VIOLATION! Two valid rows of the same primary key in levels 1+!")
+                                        print("Version: " + str(version))
+                                        print("File ids of versions: " + str(data_file_ids))
+                                        print("DV file: " + str(dv_file))
+                                        print("Rows:")
+                                        print(pk_set[pk])
+                                        print(text)
+                                        return False
+                                    else:
+                                        pk_set[pk] = text
+                                
+    return True
+            
+always assertion ConsistentRowColValues:
+    # For every possible pk, column and version, check that the linearized history
+    # (aux_key_col_log) matches reads based on metadata and data files in object storage.
+    for partition in range(NUM_PARTITIONS):
+        for bucket in range(NUM_BUCKETS):
+            for pk in bucket_pk_mapping[partition][bucket]:
+                for col in range(3, 5):
+                    for version in range(1, aux_max_version+1):
+                        model_value = ReadColFromModel(version, pk, col)
+
+                        dv_file = LookupDvFileOf(version, partition, bucket)
+                        actual_row = LookupRowInLSM(partition, bucket, version, pk, dv_file)
+
+                        if model_value == None and actual_row == None:
+                            continue
+                        elif model_value == None and actual_row != None:
+                            print("CONSISTENCY VIOLATION!")
+                            print("pk: " + str(pk) + ", col: " + str(col) + ", version: " + str(version)
+                                    + ", expected: None"
+                                    + ", actual: " + str(actual_row[col])
+                                    + ", actual row: " + str(actual_row))
+                            return False
+                        elif model_value != None and actual_row == None:
+                            print("Consistency violation!")
+                            print("pk: " + str(pk) + ", col: " + str(col) + ", version: " + str(version)
+                                    + ", expected: " + str(model_value)
+                                    + ", actual: None"
+                                    + ", actual row: None")
+                            return False
+                        elif model_value != actual_row[col]:
+                            print("Consistency violation!")
+                            print("pk: " + str(pk) + ", col: " + str(col) + ", version: " + str(version)
+                                    + ", expected: " + str(model_value)
+                                    + ", actual: " + str(actual_row[col])
+                                    + ", actual row: " + str(actual_row))
+                            return False
+
+    return True
+
+# ----------------------------------------------
+# Liveness properties
+# ----------------------------------------------
+
+eventually always assertion AllSnapshotsCommitted:
+    # We should end up with MAX_WRITE_OPS + aux_compact_count snapshots.
+    # Note that we don't use MAX_COMPACTIONS as compactions
+    # only occur in this spec if there are files to compact, so
+    # some histories will not be able to reach MAX_COMPACTIONS
+    if ONE_WRITER_PER_BUCKET:
+        snapshot_ids = object_store.List("snapshot")
+        snapshots = len(snapshot_ids)
+
+        return snapshots == MAX_WRITE_OPS + aux_compact_count
+    else:
+        # Multiple compactors can conflict and abort, so this liveness
+        # property would be violated by that topology.
+        return True
+
+# ----------------------------------------------
+# Init
+# ----------------------------------------------
+
+atomic func InitializeMapping():
+    mapping = dict()
+    for partition in range(NUM_PARTITIONS):
+        mapping[partition] = dict()
+        for bucket in range(NUM_BUCKETS):
+            mapping[partition][bucket] = set()
+    
+    return mapping
+
+atomic func RoundRobinBucketMapping(value_set, reverse):
+    # Rather than using a hash-based approach to distribute
+    # PKs among buckets, or buckets among writer, which
+    # can lead to unpredictable spreads, use a round-robin
+    # approach.
+
+    mapping = InitializeMapping()
+    reverse_mapping = dict()
+        
+    p = 0
+    b = 0
+    for value in value_set:
+        mapping[p][b].add(value)
+        pb_rec = record(partition = p, bucket = b)
+        reverse_mapping[value] = pb_rec
+
+        b += 1
+
+        if b == NUM_BUCKETS:
+            b = 0
+            p += 1
+            if p == NUM_PARTITIONS:
+                p = 0
+    if reverse:
+        return reverse_mapping
+    else:
+        return mapping
+    
+atomic func DisjointWriterBuckets(writer_count):
+    writers = range(writer_count)
+    mapping = RoundRobinBucketMapping(writers, False)
+    return mapping
+
+atomic func EachWriterAllBuckets(writer_count):
+    # Each writer can write to any bucket
+    mapping = InitializeMapping()
+    reverse_mapping = dict()
+
+    for partition in range(NUM_PARTITIONS):
+        for bucket in range(NUM_BUCKETS):
+            for w in range(writer_count):
+                mapping[partition][bucket].add(w)
+    
+    return mapping
+
+atomic func RoundRobinBucketToPkMapping(reverse):
+    mapping = RoundRobinBucketMapping(PkCol1Values, reverse)
+    return mapping
+
+atomic action Init:
+    # Aux variables
+    aux_op_count = 0
+    aux_compact_count = 0
+    aux_pk_ops = dict()
+    for pk in PkCol1Values:
+        aux_pk_ops[pk] = 0
+    aux_file_id = 0
+    aux_max_version = 0
+    aux_key_col_log = dict() # a log of column values that get committed, used in invariant
+    aux_key_insert_pending = set() # used to track when the spec allows inserts
+
+    # PK and bucket mappings to writers
+    bucket_pk_mapping = RoundRobinBucketToPkMapping(False)
+    rev_bucket_pk_mapping = RoundRobinBucketToPkMapping(True)
+    writer_count = max(NUM_WRITERS, NUM_COMPACTORS)
+    
+    bucket_writer_mapping = None
+    if ONE_WRITER_PER_BUCKET:
+        bucket_writer_mapping = DisjointWriterBuckets(writer_count)
+    else:
+        bucket_writer_mapping = EachWriterAllBuckets(writer_count)
+
+    print("Bucket->PK mapping:")
+    print(bucket_pk_mapping)
+    print("Bucket->Writer mapping:")
+    print(bucket_writer_mapping)
+
+    # Roles
+    object_store = ObjectStore()
+    lock = Lock()
+ 
+    writers = []
+    w_ctr = 0
+    for i in range(writer_count):
+        w = Writer(ID=w_ctr)
+        
+        for pk in rev_bucket_pk_mapping:
+            pb_rec = rev_bucket_pk_mapping[pk]
+            assigned_writers = bucket_writer_mapping[pb_rec.partition][pb_rec.bucket]
+            if w_ctr in assigned_writers:
+                w.AssignPk(pk, pb_rec.partition, pb_rec.bucket)
+
+        writers.append(w)
+        w_ctr += 1
+
+    print("Writers:")
+    print(writers)
