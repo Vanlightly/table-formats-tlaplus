@@ -8,29 +8,29 @@
 
 # CONSTANTS ---------------------------------
 
-NUM_WRITERS = 1                     # The number of writers
-NUM_COMPACTORS = 2                  # The number of compactors
+NUM_WRITERS = 2                     # The number of writers
+NUM_COMPACTORS = 0                  # The number of compactors
 NUM_PARTITIONS = 1                  # The number of partitions
-NUM_BUCKETS = 1                     # The number of buckets per partition
-MAX_LEVEL = 3                       # The max depth of an LSM tree
+NUM_BUCKETS = 2                     # The number of buckets per partition
+MAX_LEVEL = 2                       # The max depth of an LSM tree
 PUT_IF_ABSENT = True                # Object store supports PutIfAbsent
 USE_LOCK = False                    # The metadata commit uses a lock (necessary without PutIfAbsent)
 DV_ENABLED = True                   # Deletion vectors enabled
-ONE_WRITER_PER_BUCKET = False       # Each bucket is only written to by one writer.
+ONE_WRITER_PER_BUCKET = True        # Each bucket is only written to by one writer.
                                     # When false, all writers can write to all buckets.
 
 # State space limiting constants
 STREAMING_SINK = False              # Determines whether updates are streaming sink or read/modify/write style.
 ALLOW_UPDATES = True                # Include update queries
-ALLOW_DELETES = False               # Include delete queries
-MAX_WRITE_OPS = 2                   # The max number of write operations
+ALLOW_DELETES = True               # Include delete queries
+MAX_WRITE_OPS = 3                   # The max number of write operations
 MAX_WRITE_OPS_PER_KEY = 2           # The max number of write operations per primary key
 MAX_WRITE_OPS_PER_WRITER = 2        # The max number of write operations per writer
-MAX_COMPACTIONS = 3                 # The max number of compactions
-MAX_COMPACTIONS_PER_COMPACTOR = 2   # The max number of compactions per compactor
+MAX_COMPACTIONS = 0                 # The max number of compactions
+MAX_COMPACTIONS_PER_COMPACTOR = 0   # The max number of compactions per compactor
 
 # The primary keys and non-primary key col values
-PkCol1Values = ['jack']
+PkCol1Values = ['jack', 'sarah']
 Col2Values = ['red', 'blue']
 Col3Values = ['A']
 
