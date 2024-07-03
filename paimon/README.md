@@ -52,7 +52,6 @@ The following constants are relevant:
 - `NUM_WRITERS` and `NUM_COMPACTORS`. Writers and compactors are co-located in the same Writer instances when there is the same count of each. When the counts are different, some Writer instances may only have one of the two.
 - `NUM_PARTITIONS` and `NUM_BUCKETS`. 
 - When `ONE_WRITER_PER_BUCKET`=True, each writer instance is responsible for a disjoint set of the buckets. Thus each bucket can only have one writer instance (one instance having one writer and one compactor). Assignment to buckets is done round-robin fashion so that the assignment is predictable. When False, each writer can write to any bucket. 
-- `STREAMING_SINK`. When True, updates set the value of all columns, treating the table as not the source of truth. When False, an update performs a read/modify/write operation on one column only, treating the table as a source of truth.
 
 ### Multiple buckets, one writer/compactor per bucket
 
@@ -99,7 +98,6 @@ PUT_IF_ABSENT = True
 USE_LOCK = False
 DV_ENABLED = True
 ONE_WRITER_PER_BUCKET = False
-STREAMING_SINK = FALSE
 ALLOW_UPDATES = True
 ALLOW_DELETES = False
 MAX_WRITE_OPS = 2
@@ -110,6 +108,24 @@ MAX_COMPACTIONS_PER_COMPACTOR = 2
 PkCol1Values = ['jack'  ]
 Col2Values = ['red', 'blue']
 Col3Values = ['A']
+```
+
+Also it may be necessary right now, while Fizzbee is memory-only, to add the following custom guard clauses to reduce the state space enough to fit into 40 GB of memory. With these custom guard clauses, it hits a property violation in 25 minutes.
+
+In the `StartReadModifyUpdateOperation` action:
+
+```
+# TODO remove
+version = LatestSnapshotVersion()
+require version == 2
+```
+
+In the `StartCompaction` action.
+
+```
+# TODO remove
+version = LatestSnapshotVersion()
+require version == 1 or version == 3
 ```
 
 ## Auxilliary variables and functions

@@ -2,36 +2,36 @@
 # Author: Jack Vanlightly
 # Based on the 0.8 version.
 #
-# Models multiple writers, compactions and deletion vectors.
+# Models writers, compactions and deletion vectors.
 
 # See the README.md for a description of the spec.
 
 # CONSTANTS ---------------------------------
 
-NUM_WRITERS = 2                     # The number of writers
+NUM_WRITERS = 1                     # The number of writers
 NUM_COMPACTORS = 2                  # The number of compactors
 NUM_PARTITIONS = 1                  # The number of partitions
-NUM_BUCKETS = 2                     # The number of buckets per partition
-MAX_LEVEL = 2                       # The max depth of an LSM tree
+NUM_BUCKETS = 1                     # The number of buckets per partition
+MAX_LEVEL = 3                       # The max depth of an LSM tree
 PUT_IF_ABSENT = True                # Object store supports PutIfAbsent
 USE_LOCK = False                    # The metadata commit uses a lock (necessary without PutIfAbsent)
 DV_ENABLED = True                   # Deletion vectors enabled
-ONE_WRITER_PER_BUCKET = True        # Each bucket is only written to by one writer.
+ONE_WRITER_PER_BUCKET = False       # Each bucket is only written to by one writer.
                                     # When false, all writers can write to all buckets.
 
 # State space limiting constants
 STREAMING_SINK = False              # Determines whether updates are streaming sink or read/modify/write style.
 ALLOW_UPDATES = True                # Include update queries
 ALLOW_DELETES = False               # Include delete queries
-MAX_WRITE_OPS = 3                   # The max number of write operations
+MAX_WRITE_OPS = 2                   # The max number of write operations
 MAX_WRITE_OPS_PER_KEY = 2           # The max number of write operations per primary key
 MAX_WRITE_OPS_PER_WRITER = 2        # The max number of write operations per writer
-MAX_COMPACTIONS = 2                 # The max number of compactions
+MAX_COMPACTIONS = 3                 # The max number of compactions
 MAX_COMPACTIONS_PER_COMPACTOR = 2   # The max number of compactions per compactor
 
 # The primary keys and non-primary key col values
-PkCol1Values = ['jack'  ]
-Col2Values = ['red', 'blue', 'green']
+PkCol1Values = ['jack']
+Col2Values = ['red', 'blue']
 Col3Values = ['A']
 
 # Enums
@@ -89,6 +89,12 @@ atomic func AuxLogCommit(version, op_row, aux_col_mask):
     # This linearized history is used by the consistency check.
 
     # The spec maintains info about which keys can be inserted
+    if op_row == None:
+        print(version)
+        print(op_row)
+        print(aux_col_mask)
+        print(writers)
+
     if op_row[1] == '-D':
         if op_row[2] in aux_key_insert_pending:
             aux_key_insert_pending.remove(op_row[2])
@@ -122,7 +128,8 @@ atomic func GetManifestEntries(base_manifest_list,
     for manifest_id in manifest_list:
         manifest = object_store.Read(manifest_id)
         for entry in manifest.entries:
-            entries.append(entry)
+            if entry.file_id.startswith(prefix):
+                entries.append(entry)
 
     return entries
 
@@ -136,7 +143,7 @@ atomic func MergeManifestEntries(entries):
         if entry.kind == FileKind.ADD:
             merged_entries.append(entry)
         elif entry.kind == FileKind.DELETE:
-            # If there's a corresponds ADD entry, then remove it
+            # If there's a corresponding ADD entry, then remove it
             # as the DELETE cancels the ADD
             add_existed = False
             for index in range(len(merged_entries)):
@@ -184,7 +191,7 @@ atomic func MergeRowsOfDataFiles(pk, data_file_ids, dv_file):
     else:
         return last
 
-atomic func ListDataFilesOfVersion(partition, bucket, version):
+atomic func ListManifestEntriesOfVersion(partition, bucket, version):
     # Returns a list of data file ids of the specified partition,
     # bucket and version. Loads the snapshot, then reads the manifest
     # list files, manifest file entries to get the data file ids.
@@ -203,15 +210,15 @@ atomic func ListDataFilesOfVersion(partition, bucket, version):
                                      delta_manifest_list, 
                                      prefix)
     merged_entries = MergeManifestEntries(all_entries)
-    file_ids = FilesOfManifestEntries(merged_entries)
-    return file_ids
+    return merged_entries
     
 
 atomic func LookupRowInLSM(partition, bucket, version, pk, dv_file):
     # Performs a lookup against the bucket LSM in the object store.
     # It determines the data files that match and performs a merge
     # to return the correct row.
-    data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+    manifest_entries = ListManifestEntriesOfVersion(partition, bucket, version)
+    data_file_ids = FilesOfManifestEntries(manifest_entries)
 
     if len(data_file_ids) == 0:
         return None
@@ -237,7 +244,7 @@ atomic func ReadSnapshotFile(version):
 
 atomic func LookupDvFileOf(partition, bucket, version):
     # Returns the DV file of the specified partition, bucket and version.
-    dv = record(id = None, dvectors = dict())
+    dv = record(dvectors = dict())
     if not DV_ENABLED:
         return dv
 
@@ -431,8 +438,8 @@ role Writer:
             exists = AuxPkExists(pk)
             require exists
             
-            self.op_row = [self.sequence_no, '-D', pk]
-            self.aux_col_mask = [True, True, True, True, True]
+            self.write_op.op_row = [self.sequence_no, '-D', pk]
+            self.write_op.aux_col_mask = [True, True, True, True, True]
             self.SetOpState(partition, bucket, pk, OpType.DELETE)
             self.sequence_no += 1
             aux_op_count += 1
@@ -442,6 +449,10 @@ role Writer:
         require ALLOW_UPDATES and STREAMING_SINK == False
         require self.is_writer and self.write_op.state == State.READY 
         require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
+
+        # TODO remove :::::::::::::::::::::::::::::::::::
+        version = LatestSnapshotVersion()
+        require version == 2
 
         # This is a read, modify, write operation. Only a single non-PK column
         # gets updated, and the other remains unchanged. The column mask is
@@ -518,17 +529,22 @@ role Writer:
         require self.is_compactor and self.compact_op.state == State.READY
         require aux_compact_count < MAX_COMPACTIONS and self.compact_ctr < MAX_COMPACTIONS_PER_COMPACTOR
         
+        # TODO remove :::::::::::::::::::::::::::::::::::
+        version = LatestSnapshotVersion()
+        require version == 1 or version == 3
+
         any assignment in self.assignments:
             # Artificially constrain the spec to only do compaction of a level
             # when there are files to compact.
             levels = set()
             version = LatestSnapshotVersion()
-            data_file_ids = ListDataFilesOfVersion(assignment.partition, assignment.bucket, version)
-            
-            for data_file_id in data_file_ids:
-                data_file = object_store.Read(data_file_id)
-                if data_file.level < MAX_LEVEL:
-                    levels.add(data_file.level)
+            manifest_entries = ListManifestEntriesOfVersion(
+                                    assignment.partition, 
+                                    assignment.bucket, version)
+                        
+            for entry in manifest_entries:
+                if entry.level < MAX_LEVEL:
+                    levels.add(entry.level)
 
             require len(levels) > 0
 
@@ -564,25 +580,23 @@ role Writer:
         op = self.compact_op
 
         # Load the data files of current snapshot of the target level
-        version = LatestSnapshotVersion()
-        snapshot = ReadSnapshotFile(version)
-        dv_file = LookupDvFileOf(op.partition, op.bucket, version)
-        data_file_ids = ListDataFilesOfVersion(op.partition, op.bucket, version)
+        latest_version = LatestSnapshotVersion()
+        snapshot = ReadSnapshotFile(latest_version)
+        dv_file = LookupDvFileOf(op.partition, op.bucket, latest_version)
+        manifest_entries = ListManifestEntriesOfVersion(op.partition, op.bucket, latest_version)
         
-        data_files = list()
         source_file_ids = list()
-        for data_file_id in data_file_ids:
-            data_file = object_store.Read(data_file_id)
-            if data_file.level == op.level:
-                data_files.append(data_file)
-                source_file_ids.append(data_file_id)
+        for entry in manifest_entries:
+            if entry.level == op.level:
+                source_file_ids.append(entry.file_id)
         
         # Do an equivalent of a multiway merge. For simplicity, it
         # reuses the PK scoped merge used by key lookup.
         final_rows = list()
         updated_keys = set()
-        for pk in PkCol1Values:
-            row = MergeRowsOfDataFiles(pk, data_file_ids, dv_file)
+        for assignment in self.assignments:
+            pk = assignment.pk
+            row = MergeRowsOfDataFiles(pk, source_file_ids, dv_file)
             if row != None:
                 if DV_ENABLED and (row[1] == '-D' or row[1] == '+U'):
                     updated_keys.add(row[2])
@@ -602,33 +616,19 @@ role Writer:
 
         # May update deletion vectors -----------------------------
         if DV_ENABLED and len(updated_keys) > 0:
-            # Get the current DV file, if any, update it and write it back.
-            lastest_version = LatestSnapshotVersion()
-
-            # Get the data file ids of the bucket
-            data_file_ids = list()
-            if (lastest_version > 0):
-                snapshot = ReadSnapshotFile(lastest_version)
-                prefix = DataFileNamePrefix(op.partition, op.bucket)
-                base_manifest_list = object_store.Read(snapshot.base_manifest_list)
-                delta_manifest_list = object_store.Read(snapshot.delta_manifest_list)
-                all_entries = GetManifestEntries(base_manifest_list,
-                                                 delta_manifest_list, 
-                                                 prefix)
-                merged_entries = MergeManifestEntries(all_entries)
-                data_file_ids = FilesOfManifestEntries(merged_entries)
-                            
+            
             # Update the DV file. Only check data files in higher levels than the compaction.
-            for data_file_id in data_file_ids:
-                data_file = object_store.Read(data_file_id)
-                if data_file.level > op.level:
+            for entry in manifest_entries:
+                if entry.level > op.level:
                     index = 0
+                    # An implementation would use the local lookup cache here
+                    data_file = object_store.Read(entry.file_id)
                     for drow in data_file.rows:
                         if drow[2] in updated_keys:
-                            if data_file_id not in dv_file.dvectors:
-                                dv_file.dvectors[data_file_id] = set()    
-                            if index not in dv_file.dvectors[data_file_id]:
-                                dv_file.dvectors[data_file_id].add(index)
+                            if entry.file_id not in dv_file.dvectors:
+                                dv_file.dvectors[entry.file_id] = set()    
+                            if index not in dv_file.dvectors[entry.file_id]:
+                                dv_file.dvectors[entry.file_id].add(index)
                         index += 1
 
             # Write it as a new DV file
@@ -651,7 +651,9 @@ role Writer:
             # Write the manifest file of the new/removed data files ----------
             manifest_file_id = ManifestFileName()
             manifest_file_entries = list()
-            add_entry = record(kind = FileKind.ADD, file_id = op.data_file_id)
+            add_entry = record(kind = FileKind.ADD, 
+                               file_id = op.data_file_id, 
+                               level = op.data_file.level)
             manifest_file_entries.append(add_entry)
                         
             if op.delete_file_ids != None:
@@ -817,7 +819,7 @@ role Lock:
         self.lock = None
 
     atomic func AcquireLock(writer_id):
-        require self.lock == None
+        require self.lock == None or self.lock == writer_id
         self.lock = writer_id
 
     atomic func FreeLock(writer_id):
@@ -912,7 +914,7 @@ always assertion SequentialSnapshotIds:
 
     return True
 
-always assertion NoDanglingDeletionVector:
+always assertion NoDanglingDeletionVectors:
     # Checks that all deletion vectors in all deletion vector files
     # of each version, point to a data file that exists in that same version.
     # If a deletion vector points to a file that no longer logically exists,
@@ -921,7 +923,8 @@ always assertion NoDanglingDeletionVector:
         for partition in range(NUM_PARTITIONS):
             for bucket in range(NUM_BUCKETS):
                 for version in range(1, aux_max_version+1):
-                    data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+                    manifest_entries = ListManifestEntriesOfVersion(partition, bucket, version)
+                    data_file_ids = FilesOfManifestEntries(manifest_entries)
                     dv_file = LookupDvFileOf(partition, bucket, version)
 
                     for file_id in dv_file.dvectors:
@@ -933,7 +936,7 @@ always assertion NoDanglingDeletionVector:
 
     return True
 
-always assertion WithDeletionVectorsInLevels1PlusOnlyOneValidRowPerPk:
+always assertion DVEnabledOnlyOneValidRowPerPkInLevels1Plus:
     # Checks that for every primary key, in every version, in levels 1
     # and above, that there do not exist two valid rows (not referred to
     # in a DV file). This is violated when dangling DVs occur.
@@ -942,7 +945,8 @@ always assertion WithDeletionVectorsInLevels1PlusOnlyOneValidRowPerPk:
             for bucket in range(NUM_BUCKETS):
                 for pk in bucket_pk_mapping[partition][bucket]:
                     for version in range(1, aux_max_version+1):
-                        data_file_ids = ListDataFilesOfVersion(partition, bucket, version)
+                        manifest_entries = ListManifestEntriesOfVersion(partition, bucket, version)
+                        data_file_ids = FilesOfManifestEntries(manifest_entries)
                         dv_file = LookupDvFileOf(partition, bucket, version)
 
                         pk_set = dict()
@@ -973,7 +977,7 @@ always assertion WithDeletionVectorsInLevels1PlusOnlyOneValidRowPerPk:
                                 
     return True
             
-always assertion ConsistentRowColValues:
+always assertion ConsistentRead:
     # For every possible pk, column and version, check that the linearized history
     # (aux_key_col_log) matches reads based on metadata and data files in object storage.
     for partition in range(NUM_PARTITIONS):
@@ -1141,3 +1145,25 @@ atomic action Init:
 
     print("Writers:")
     print(writers)
+
+    print("CONSTANTS:")
+    print("NUM_WRITERS = " + str(NUM_WRITERS))
+    print("NUM_COMPACTORS = " + str(NUM_COMPACTORS))
+    print("NUM_PARTITIONS = " + str(NUM_PARTITIONS))
+    print("NUM_BUCKETS = " + str(NUM_BUCKETS))
+    print("MAX_LEVEL = " + str(MAX_LEVEL))
+    print("PUT_IF_ABSENT = " + str(PUT_IF_ABSENT))
+    print("USE_LOCK = " + str(USE_LOCK))
+    print("DV_ENABLED = " + str(DV_ENABLED))
+    print("ONE_WRITER_PER_BUCKET = " + str(ONE_WRITER_PER_BUCKET))
+    print("STREAMING_SINK = " + str(STREAMING_SINK))
+    print("ALLOW_UPDATES = " + str(ALLOW_UPDATES))
+    print("ALLOW_DELETES = " + str(ALLOW_DELETES))
+    print("MAX_WRITE_OPS = " + str(MAX_WRITE_OPS))
+    print("MAX_WRITE_OPS_PER_KEY = " + str(MAX_WRITE_OPS_PER_KEY))
+    print("MAX_WRITE_OPS_PER_WRITER = " + str(MAX_WRITE_OPS_PER_WRITER))
+    print("MAX_COMPACTIONS = " + str(MAX_COMPACTIONS))
+    print("MAX_COMPACTIONS_PER_COMPACTOR = " + str(MAX_COMPACTIONS_PER_COMPACTOR))
+    print("PkCol1Values = " + str(PkCol1Values))
+    print("Col2Values = " + str(Col2Values))
+    print("Col3Values = " + str(Col3Values))
