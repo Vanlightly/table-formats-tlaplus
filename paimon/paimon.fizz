@@ -450,10 +450,6 @@ role Writer:
         require self.is_writer and self.write_op.state == State.READY 
         require aux_op_count < MAX_WRITE_OPS and self.sequence_no < MAX_WRITE_OPS_PER_WRITER
 
-        # TODO remove :::::::::::::::::::::::::::::::::::
-        version = LatestSnapshotVersion()
-        require version == 2
-
         # This is a read, modify, write operation. Only a single non-PK column
         # gets updated, and the other remains unchanged. The column mask is
         # used to mark which columns were changed. This is used by the consistency
@@ -529,10 +525,6 @@ role Writer:
         require self.is_compactor and self.compact_op.state == State.READY
         require aux_compact_count < MAX_COMPACTIONS and self.compact_ctr < MAX_COMPACTIONS_PER_COMPACTOR
         
-        # TODO remove :::::::::::::::::::::::::::::::::::
-        version = LatestSnapshotVersion()
-        require version == 1 or version == 3
-
         any assignment in self.assignments:
             # Artificially constrain the spec to only do compaction of a level
             # when there are files to compact.
