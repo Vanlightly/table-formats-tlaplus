@@ -1,0 +1,1251 @@
+# Apache Iceberg fizzbee spec -----------------------------
+# Author: Jack Vanlightly
+# Based on the v2 spec.
+#
+# Models writers, compactions, copy-on-write and merge-on-read
+# but excludes partitions for now.
+# Models a workload where the 1st column acts as an id column
+# (a primary key though Iceberg does not support primary keys),
+# and the workload does not introduce duplicate rows.
+
+# This is entirely reverse engineered from the code, so many
+# concepts in the code are represented here.
+
+# See the README.md for a description of the spec.
+
+# ----------------------------------------------
+# Constants
+# ----------------------------------------------
+
+TableMode = enum('COPY_ON_WRITE', 'MERGE_ON_READ')
+CONFIGURED_TABLE_MODE = TableMode.COPY_ON_WRITE
+
+Isolation = enum('SERIALIZABLE', 'SNAPSHOT_ISOLATION')
+CONFIGURED_ISOLATION = Isolation.SERIALIZABLE
+NUM_WRITERS = 2
+
+# State space limiting constants
+ALLOW_UPDATES = True               # Include update queries
+ALLOW_DELETES = True               # Include delete queries
+MAX_WRITE_OPS = 3                  # The max number of write operations
+MAX_COMPACTION_OPS = 1             # The max number of compactions
+
+# Column values, each col1 value represents a possible row in the table.
+# Col 1 values are not duplicated, so if there are 2 values then there are 2 possible rows.
+Col1Values = ['jack']
+Col2Values = ['red', 'blue']
+Col3Values = ['A']
+
+State = enum('READY', 'READ_DATA_FILES', 'WRITE_DATA_FILES', 'WRITE_METADATA_FILES',
+             'PREPARE_COMMIT', 'COMMIT', 'COMMITTED', 'ABORTED', 'BAD_STATE')
+SqlOpType = enum('INSERT', 'UPDATE', 'DELETE', 'NOOP') 
+DataOp = enum('APPEND', 'OVERWRITE', 'DELETE', 'REPLACE') # Refers to files not rows
+SnapshotUpdateType = enum('MERGE_APPEND', 'ROW_DELTA', 'OVERWRITE_FILES', 'REWRITE_FILES')
+ManifestEntryStatus = enum('ADDED', 'EXISTING', 'DELETED')
+DataFileContent = enum('DATA', 'POS_DELETE', 'EQ_DELETE')
+ManifestFileContent = enum('DATA', 'DELETES')
+Result = enum('OK', 'COMMIT_FAILED', 'VALIDATION_FAILED', 'ALREADY_EXISTS')
+
+# ----------------------------------------------
+# Common functions 
+# ----------------------------------------------
+
+atomic func DataFileName():
+    name = 'data-' + str(aux_file_id['data'])
+    aux_file_id['data'] = aux_file_id['data'] + 1
+    return name
+
+atomic func DeleteFileName():
+    name = 'delete-' + str(aux_file_id['delete'])
+    aux_file_id['delete'] = aux_file_id['delete'] + 1
+    return name
+
+atomic func ManifestFileName():
+    name = 'manifest-' + str(aux_file_id['manifest'])
+    aux_file_id['manifest'] = aux_file_id['manifest'] + 1
+    return name
+
+atomic func ManifestListFileName():
+    name = 'manifestlist-' + str(aux_file_id['manifestlist'])
+    aux_file_id['manifestlist'] = aux_file_id['manifestlist'] + 1
+    return name
+
+atomic func MetadataFileName(version):
+    if version not in aux_md_uuid:
+        aux_md_uuid[version] = 1
+
+    name = 'metadata-' + str(version) + '-uuid' + str(aux_md_uuid[version])
+    aux_md_uuid[version] = aux_md_uuid[version] + 1
+    return name
+
+atomic func CurrentMetadata():
+    metadata_location = catalog.CurrentMetadataLocation()
+    if metadata_location == None:
+        return None
+    
+    metadata = object_store.Read(metadata_location)
+    return metadata
+
+atomic func RecordHistory(version, sql_op, row_history, set_values):
+    # Logs any changed column values in a linearized history per col 1 value.
+    # This linearized history is used by the consistency check.
+
+    # The spec maintains info about which keys can be inserted
+    # aux_key_insert_pending is used to prevent duplicate inserts
+    if sql_op == SqlOpType.INSERT:
+        row = row_history[0]
+        if row[0] in aux_key_insert_pending:
+            aux_key_insert_pending.remove(row[0])
+
+    # Add an entry for this id column in the model
+    for row in row_history:
+        id_col = row[0]
+        if id_col not in aux_key_col_log:
+            aux_key_col_log[id_col] = {}
+
+        # Log each column value in the model
+        for col in range(1, 3):
+            if col not in aux_key_col_log[id_col]:
+                aux_key_col_log[id_col][col] = []
+
+            if sql_op == SqlOpType.INSERT:
+                rec = record(version = version, value = row[col])
+                aux_key_col_log[id_col][col].append(rec)
+            elif sql_op == SqlOpType.DELETE:
+                rec = record(version = version, value = None)
+                aux_key_col_log[id_col][col].append(rec)
+            elif sql_op == SqlOpType.UPDATE:
+                # If the column value was changed, append the new value to the history
+                if set_values[col] != None:
+                    rec = record(version = version, value = row[col])
+                    aux_key_col_log[id_col][col].append(rec)
+            
+
+atomic func ReadColFromHistoryModel(version, id_col, col_number):
+    # Performs a read against the linearized history variable,
+    # and returns the expected column value based on the provided
+    # version.
+    if id_col not in aux_key_col_log:
+        return None
+
+    if col_number not in aux_key_col_log[id_col]:
+        return None
+    
+    value = None
+    for entry in aux_key_col_log[id_col][col_number]:
+        if entry.version <= version:
+            value = entry.value
+        else:
+            break
+
+    return value
+
+atomic func PredicateMatchesInHistoryModel(predicate):
+    # Returns the number of rows that match the predicate in the history model
+
+    metadata = CurrentMetadata()
+    if metadata == None:
+        return 0
+    
+    count = 0
+
+    # search the history model for matches
+    for id_col in Col1Values:
+        # Each id_col value represents a row in this spec (it doesn't duplicate Col1Values)
+
+        expected = 0 # the expected number of column matches
+        actual = 0   # the actual number of column matches
+
+        if predicate[0] != None:
+            if predicate[0] == id_col:
+                expected += 1
+                # Read any col value for this row, if it isn't None then the row exists
+                read = ReadColFromHistoryModel(metadata.version, id_col, 1) 
+                if read != None:
+                    actual += 1
+            else:
+                # doesn't match the id column predicate so skip
+                continue
+
+        # check the other columns, if the predicate is non-None then increment
+        # the expected, if it matches the predicate, increment the actual.
+        for col_number in range(1, 3):
+            if predicate[col_number] != None:
+                expected += 1
+                read = ReadColFromHistoryModel(metadata.version, id_col, col_number) 
+                if read == predicate[col_number]:
+                    actual += 1
+
+        if expected == actual:
+            count += 1
+    
+    return count
+
+atomic func GetDeleteFiles(metadata):
+    # Returns the delete files of this metadata version
+
+    delete_files = []
+    manifest_list = object_store.Read(metadata.current_snapshot.manifest_list_path)
+    for list_entry in manifest_list:
+        if list_entry.content == ManifestFileContent.DELETES:
+            manifest_file = object_store.Read(list_entry.manifest_path)
+            for entry in manifest_file.entries:
+                if entry.status != ManifestEntryStatus.DELETED:
+                    delete_file = object_store.Read(entry.data_file.file_path)
+                    rec = record(sequence_no = entry.data_sequence_no,
+                                 delete_file = delete_file)
+                    delete_files.append(rec)
+
+    return delete_files
+
+atomic func IsDeleted(delete_files, entry, row_index):
+    # evaluates whether a given row_index of a data file is deleted or not.
+
+    for delete in delete_files:
+        if delete.sequence_no >= entry.data_sequence_no:
+            for del_row in delete.delete_file:
+                if (del_row[0] == entry.data_file.file_path
+                        and del_row[1] == row_index):
+                    return True
+    
+    return False
+
+atomic func IsMatch(row, predicate):
+    # Evaluates whether the row matches the predicate.
+
+    if predicate == None:
+        return True
+
+    expected = 0
+    actual = 0
+
+    for col in range(3):
+        if predicate[col] != None:
+            expected += 1
+            if row[col] == predicate[col]:
+                actual += 1
+    
+    return expected == actual
+
+atomic func Scan(metadata_location, predicate):
+    # Performs a table scan based on the provided metadata location
+    # and an optional predicate. Returns results as a set of rows
+    # per host data file.
+
+    scan = []
+
+    metadata = object_store.Read(metadata_location)
+    if metadata == None:
+        return scan
+
+    delete_files = []
+    if CONFIGURED_TABLE_MODE == TableMode.MERGE_ON_READ:
+        delete_files = GetDeleteFiles(metadata)
+
+    manifest_list = object_store.Read(metadata.current_snapshot.manifest_list_path)
+    for entry in manifest_list:
+        manifest_file = object_store.Read(entry.manifest_path)        
+        
+        for entry in manifest_file.entries:
+            if (entry.data_file.content == DataFileContent.DATA
+                    and (entry.status == ManifestEntryStatus.ADDED
+                         or entry.status == ManifestEntryStatus.EXISTING)):
+                data_file = object_store.Read(entry.data_file.file_path)
+                data_file_result = record(file_path = data_file.file_path,
+                                          rows = [])
+                for row_index in range(len(data_file.rows)):
+                    row = data_file.rows[row_index]
+                    is_deleted = IsDeleted(delete_files, entry, row_index)
+                    is_match = IsMatch(row, predicate)
+                    if not is_deleted and is_match:
+                        row_rec = record(row_index = row_index, row = row)
+                        data_file_result.rows.append(row_rec)            
+
+                if len(data_file_result.rows) > 0:
+                    scan.append(data_file_result)
+
+    return scan
+
+# ----------------------------------------------
+# WRITER role
+# ----------------------------------------------
+role Writer:
+    atomic action Init:
+        self.op = record(state = State.READY)
+
+    atomic fair action StartInsertOperation:
+        require self.op.state in [State.READY, State.COMMITTED, State.ABORTED]
+        require aux_op_count < MAX_WRITE_OPS
+
+        scan_metadata = CurrentMetadata()
+        scan_location = scan_metadata.location if scan_metadata != None else None
+        scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id if scan_metadata != None else 0
+
+        id_col = any Col1Values
+                    
+        # Constrain the spec to only try to insert any given id column value once and one at a time.
+        matches = PredicateMatchesInHistoryModel([id_col, None, None])
+        require matches == 0 and id_col not in aux_key_insert_pending
+            
+        col2 = any Col2Values
+        col3 = any Col3Values
+        # the column values of the row to insert
+        set_values = [id_col, col2, col3]
+
+        self.op = record(data_op = DataOp.APPEND,
+                         sql_op = SqlOpType.INSERT,
+                         snapshot_update = SnapshotUpdateType.MERGE_APPEND,
+                         scan_metadata_location = scan_location,
+                         scan_snapshot_id = scan_snapshot_id,
+                         state = State.WRITE_DATA_FILES,
+                         set_values = set_values,
+                         row_history = [set_values],
+                         added_data_files = [],
+                         deleted_data_files = [],
+                         added_delete_files = [],
+                         deleted_delete_files = [],
+                         metadata_files = [])
+        aux_key_insert_pending.add(id_col)
+        aux_op_count += 1
+
+    atomic fair action StartDeleteOperation:
+        require self.op.state in [State.READY, State.COMMITTED, State.ABORTED]
+        require ALLOW_DELETES and aux_op_count < MAX_WRITE_OPS
+        
+        # Non-deterministically choose a predicate for the delete op
+        predicate = None
+        oneof:
+            atomic:
+                id_col = any Col1Values
+                predicate = [id_col, None, None]
+            atomic:
+                col2 = any Col2Values
+                predicate = [None, col2, None]
+            atomic:
+                col3 = any Col3Values
+                predicate = [None, None, col3]
+
+        # Artifically constrain the spec to only attempt deletes with
+        # predicates that match at least one row at the time it begins.
+        matching_rows = PredicateMatchesInHistoryModel(predicate) 
+        require matching_rows > 0
+
+        # Nothing to update or insert
+        set_values = [None, None, None]
+
+        scan_metadata = CurrentMetadata()
+        require scan_metadata != None
+                
+        snapshot_update_type = None
+        if CONFIGURED_TABLE_MODE == TableMode.COPY_ON_WRITE:
+            snapshot_update_type = SnapshotUpdateType.OVERWRITE_FILES
+        else:
+            snapshot_update_type = SnapshotUpdateType.ROW_DELTA
+
+        self.op = record(data_op = DataOp.OVERWRITE,
+                         sql_op = SqlOpType.DELETE,
+                         snapshot_update = snapshot_update_type,
+                         scan_metadata_location = scan_metadata.location,
+                         scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id,
+                         state = State.READ_DATA_FILES,
+                         set_values = set_values,
+                         predicate = predicate,
+                         row_history = [],
+                         added_data_files = [],
+                         deleted_data_files = [],
+                         added_delete_files = [],
+                         deleted_delete_files = [],
+                         metadata_files = [])
+        aux_op_count += 1
+
+    atomic fair action StartUpdateOperation:
+        require self.op.state in [State.READY, State.COMMITTED, State.ABORTED]
+        require ALLOW_UPDATES and aux_op_count < MAX_WRITE_OPS
+        
+        # Non-deterministically choose a predicate for the update op
+        predicate = None
+        oneof:
+            atomic:
+                id_col = any Col1Values
+                predicate = [id_col, None, None]
+            atomic:
+                col2 = any Col2Values
+                predicate = [None, col2, None]
+            atomic:
+                col3 = any Col3Values
+                predicate = [None, None, col3]
+
+        # Artifically constrain the spec to only attempt updates with
+        # predicates that match at least one row at the time it begins.
+        matching_rows = PredicateMatchesInHistoryModel(predicate) 
+        require matching_rows > 0
+
+        scan_metadata = CurrentMetadata()
+        
+        # Non-deterministically choose one column to modify
+        set_values = [None, None, None]
+        
+        # Choose a value that is different from the predicate for the chosen column.
+        # Artifically constrain the spec to only perform an update that will change a row.
+        # If the matching rows of the predicate and the matching rows of the 
+        # "predicate + update" are the same, then nothing would change.
+        oneof:
+            atomic:
+                col2 = any Col2Values : predicate[1] != col2
+                set_values[1] = col2
+                update_rows = PredicateMatchesInHistoryModel([predicate[0], col2, predicate[2]])
+                require matching_rows != update_rows
+            atomic:
+                # Choose a value that is different from the predicate for column 3
+                col3 = any Col3Values : predicate[2] != col3
+                set_values[2] = col3
+                update_rows = PredicateMatchesInHistoryModel([predicate[0], predicate[1], col3])
+                require matching_rows != update_rows
+
+        snapshot_update_type = None
+        if CONFIGURED_TABLE_MODE == TableMode.COPY_ON_WRITE:
+            snapshot_update_type = SnapshotUpdateType.OVERWRITE_FILES
+        else:
+            snapshot_update_type = SnapshotUpdateType.ROW_DELTA
+
+        self.op = record(data_op = DataOp.OVERWRITE,
+                         sql_op = SqlOpType.UPDATE,
+                         snapshot_update = snapshot_update_type,
+                         scan_metadata_location = scan_metadata.location,
+                         scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id,
+                         state = State.READ_DATA_FILES,
+                         set_values = set_values,
+                         predicate = predicate,
+                         row_history = [],
+                         added_data_files = [],
+                         deleted_data_files = [],
+                         added_delete_files = [],
+                         deleted_delete_files = [],
+                         metadata_files = [])
+        aux_op_count += 1
+
+    atomic fair action StartCompactionOperation:
+        require self.op.state in [State.READY, State.COMMITTED, State.ABORTED]
+        require aux_compaction_count < MAX_COMPACTION_OPS
+        
+        scan_metadata = CurrentMetadata()
+        require scan_metadata != None
+
+        self.op = record(data_op = DataOp.REPLACE,
+                         sql_op = SqlOpType.NOOP,
+                         snapshot_update = SnapshotUpdateType.REWRITE_FILES,
+                         scan_metadata_location = scan_metadata.location,
+                         scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id,
+                         state = State.READ_DATA_FILES,
+                         added_data_files = [],
+                         deleted_data_files = [],
+                         added_delete_files = [],
+                         deleted_delete_files = [],
+                         metadata_files = [])
+        aux_compaction_count += 1
+
+    atomic fair action ReadDataFilesForCopyOnWrite:
+        # Perform a table scan, record which data files match the predicate
+        # and generate new rows according to the update/delete op.
+
+        require self.op.state == State.READ_DATA_FILES
+        require self.op.snapshot_update == SnapshotUpdateType.OVERWRITE_FILES
+
+        scan_result = Scan(self.op.scan_metadata_location, self.op.predicate)
+        
+        original_file_paths = []
+        new_data_file_rows = []
+
+        for data_file_result in scan_result:
+            data_file = object_store.Read(data_file_result.file_path)
+            original_file_paths.append(data_file.file_path)
+            new_rows = []
+
+            for row_index in range(len(data_file.rows)):
+                row = data_file.rows[row_index]
+                is_match = IsMatch(row, self.op.predicate)
+                if is_match:
+                    if self.op.sql_op == SqlOpType.DELETE:
+                        # Delete the row by not adding it to the new rows.
+                        # Log the delete in the row_history variable used by correctness checks
+                        self.op.row_history.append([row[0], None, None])
+                        continue
+                    elif self.op.sql_op == SqlOpType.UPDATE:
+                        # Update the row based on the set_values. Log the update
+                        # in the row_history variable used by correctness checks
+                        new_row = row
+                        for col in range (1, 3):
+                            if self.op.set_values[col] != None:
+                                new_row[col] = self.op.set_values[col]
+                        new_rows.append(new_row)
+                        self.op.row_history.append(new_row)
+                else:
+                    new_rows.append(row)
+            
+              new_data_file_rows.append(new_rows)
+
+        self.op.original_file_paths = original_file_paths
+        self.op.new_data_file_rows = new_data_file_rows
+        self.op.state = State.WRITE_DATA_FILES
+
+    atomic fair action ReadDataFilesForMergeOnRead:
+        # Perform a table scan, record which data file rows need a delete entry
+        # and generate new rows according to the update/delete op.
+
+        require self.op.state == State.READ_DATA_FILES
+        require self.op.snapshot_update == SnapshotUpdateType.ROW_DELTA
+
+        scan_result = Scan(self.op.scan_metadata_location, self.op.predicate)
+
+        deletes = []
+        referenced_data_files = set()
+        new_rows = []
+
+        for data_file_result in scan_result:
+            for row_result in data_file_result.rows:
+                row = row_result.row
+                if self.op.sql_op == SqlOpType.DELETE or self.op.sql_op == SqlOpType.UPDATE:
+                    deletes.append([data_file_result.file_path, row_result.row_index])
+                    referenced_data_files.add(data_file_result.file_path)
+                    
+                    if self.op.sql_op == SqlOpType.DELETE:
+                        # Log the delete in the row_history variable used by correctness checks
+                        self.op.row_history.append([row[0], None, None])
+                    if self.op.sql_op == SqlOpType.UPDATE:
+                        # Update the row based on the set_values. Log the update
+                        # in the row_history variable used by correctness checks
+                        new_row = row
+                        for col in range (1, 3):
+                            if self.op.set_values[col] != None:
+                                new_row[col] = self.op.set_values[col]
+                        new_rows.append(new_row)
+                        self.op.row_history.append(new_row)
+
+        self.op.deletes = deletes
+        self.op.referenced_data_files = referenced_data_files
+        self.op.new_data_file_rows = [new_rows]
+        self.op.state = State.WRITE_DATA_FILES
+
+    atomic fair action ReadDataFilesForCompaction:
+        # Perform a table scan and store the result. A compaction will
+        # compact the whole table into one data file (this is a small model).
+
+        require self.op.state == State.READ_DATA_FILES
+        require self.op.snapshot_update == SnapshotUpdateType.REWRITE_FILES
+        
+        scan_result = Scan(self.op.scan_metadata_location, None)
+        self.op.compaction_scan = scan_result
+        self.op.state = State.WRITE_DATA_FILES
+
+    atomic fair action WriteDataFiles:
+        # Write the data files (and possibly delete files) according to the type of DataOp.
+
+        require self.op.state == State.WRITE_DATA_FILES
+
+        op = self.op
+
+        # Write a new data file
+        if op.data_op == DataOp.APPEND:
+            file_path = DataFileName()
+            data_file = record(file_path = file_path, rows = [op.set_values])
+            object_store.Write(file_path, data_file)
+            op.added_data_files.append(file_path)
+        elif op.data_op == DataOp.OVERWRITE:
+            if self.op.snapshot_update == SnapshotUpdateType.OVERWRITE_FILES:
+                for new_rows in self.op.new_data_file_rows:
+                    new_file_path = DataFileName()
+                    new_data_file = record(file_path = new_file_path, rows = new_rows)
+                    object_store.Write(new_file_path, new_data_file)
+                    op.added_data_files.append(new_file_path)
+
+                op.deleted_data_files.extend(self.op.original_file_paths)
+
+            elif self.op.snapshot_update == SnapshotUpdateType.ROW_DELTA:
+                if self.op.sql_op == SqlOpType.UPDATE:
+                    for new_rows in self.op.new_data_file_rows:
+                        data_file_path = DataFileName()
+                        data_file = record(file_path = data_file_path, rows = new_rows)
+                        object_store.Write(data_file_path, data_file)
+                        op.added_data_files.append(data_file_path)
+
+                delete_file_path = DeleteFileName()
+                object_store.Write(delete_file_path, self.op.deletes)
+                op.added_delete_files.append(delete_file_path)
+        elif op.data_op == DataOp.REPLACE:
+            file_path = DataFileName()
+            rows = []
+            for data_file_result in op.compaction_scan:
+                op.deleted_data_files.append(data_file_result.file_path)
+                for row_result in data_file_result.rows:
+                    rows.append(row_result.row)
+
+            data_file = record(file_path = file_path, rows = rows)
+            object_store.Write(file_path, data_file)
+            op.added_data_files.append(file_path)
+
+        op.state = State.WRITE_METADATA_FILES
+
+        self.op = op
+
+    atomic func GetValidationHistory(current_metadata, starting_snapshot_id,
+                                     matching_operations, matching_content):
+        # Get all snapshots and manifest files after the scan snapshot
+
+        manifests = []
+        snapshots = []
+        gathering = False
+        for snapshot in current_metadata.snapshots:
+            if snapshot.snapshot_id == starting_snapshot_id:
+                gathering = True
+                continue
+
+            if gathering:
+                snapshots.append(snapshot.snapshot_id)
+                if snapshot.operation in matching_operations:
+                    manifest_list = object_store.Read(snapshot.manifest_list_path)
+                    for list_entry in manifest_list:
+                        if (list_entry.content == matching_content
+                                and list_entry.snapshot_id == snapshot.snapshot_id):
+                            manifest = object_store.Read(list_entry.manifest_path)
+                            manifests.append(manifest)
+
+        result = record(manifests = manifests, snapshots = snapshots)
+        return result
+
+    atomic func ValidateAddedDataFiles(current_metadata, starting_snapshot_id):
+        # If any append/overwrite data files were added after the starting snapshot,
+        # the validation fails.
+
+        history = self.GetValidationHistory(current_metadata, starting_snapshot_id,
+                                            [DataOp.APPEND, DataOp.OVERWRITE],
+                                            ManifestFileContent.DATA)
+
+        # In the code: ignoreDeleted().ignoreExisting()
+        entries = []
+        for manifest in history.manifests:
+            if manifest.added_file_count > 0:
+                for entry in manifest.entries:
+                    if (entry.status != ManifestEntryStatus.EXISTING
+                            and entry.status != ManifestEntryStatus.DELETED
+                            and entry.snapshot_id in history.snapshots):
+                        entries.append(entry)
+
+        if len(entries) > 0:
+            return Result.VALIDATION_FAILED
+
+        return Result.OK
+
+    atomic func GetAddedDeleteFiles(current_metadata, starting_snapshot_id):
+        # Gather the added delete files since the sequence of the starting snapshot
+
+        history = self.GetValidationHistory(current_metadata, starting_snapshot_id,
+                                            [DataOp.DELETE, DataOp.OVERWRITE],
+                                            ManifestFileContent.DELETES)
+        
+        # Determine the min sequence number
+        starting_seq_no = current_metadata.last_sequence_no
+        for snapshot in current_metadata.snapshots:
+            if snapshot.snapshot_id == starting_snapshot_id:
+                starting_seq_no = snapshot.sequence_no
+
+        # Load the delete files of the matching manifests
+        delete_files = []
+        for manifest in history.manifests:
+            if (manifest.content == ManifestFileContent.DELETES
+                    and (manifest.added_file_count > 0 
+                         or manifest.existing_file_count > 0)):
+                for entry in manifest.entries:
+                    # only live entries after the seq no
+                    if (entry.status != ManifestEntryStatus.DELETED
+                            and entry.data_sequence_no > starting_seq_no):
+                        delete_file = object_store.Read(entry.data_file.file_path)
+                        delete_files.append(delete_file)
+
+        return delete_files
+
+    atomic func ValidateNoNewDeletesForDataFiles(current_metadata, starting_snapshot_id, 
+                                                 deleted_data_files):
+        # If any delete files were added after the starting snapshot, that reference one
+        # of the deleted data files, then validation fails.
+
+        delete_files = self.GetAddedDeleteFiles(current_metadata, starting_snapshot_id)
+
+        # Check if any deleted data file has a delete file that was added since
+        # the scan snapshot. If so, then a conflict has occurred
+        for data_file_path in deleted_data_files:
+            for delete_file in delete_files:
+                for row in delete_file:
+                    if row[0] == data_file_path:
+                        return Result.VALIDATION_FAILED
+
+        return Result.OK
+
+    atomic func ValidateNoNewDeletes(current_metadata, starting_snapshot_id):
+        # If any delete files were added after the starting snapshot, then validation fails
+
+        delete_files = self.GetAddedDeleteFiles(current_metadata, starting_snapshot_id)
+
+        if len(delete_files) > 0:
+            return Result.VALIDATION_FAILED
+
+        return Result.OK
+
+    atomic func ValidateDataFilesExist(current_metadata, starting_snapshot_id):
+        # If any of the referenced data files (referenced by a new delete file)
+        # were deleted in a snapshot after the starting snapshot, then validation fails.
+
+        history = self.GetValidationHistory(current_metadata, starting_snapshot_id,
+                                            [DataOp.OVERWRITE, DataOp.REPLACE, DataOp.DELETE],
+                                            ManifestFileContent.DATA)
+
+        # In the code: ignoreExisting()
+        entries = []
+        for manifest in history.manifests:
+            if manifest.added_file_count > 0 or manifest.deleted_file_count > 0:
+                for entry in manifest.entries:
+                    if (entry.status != ManifestEntryStatus.EXISTING
+                            and entry.status != ManifestEntryStatus.ADDED
+                            and entry.snapshot_id in history.snapshots
+                            and entry.data_file.file_path in self.op.referenced_data_files):
+                        entries.append(entry)
+
+        if len(entries) > 0:
+            return Result.VALIDATION_FAILED
+
+        return Result.OK
+
+    atomic func MergeAppendValidation(current_metadata, starting_snapshot_id, parent_snapshot):
+        return Result.OK
+
+    atomic func RowDeltaValidation(current_metadata, starting_snapshot_id, parent_snapshot):
+        result = self.ValidateDataFilesExist(current_metadata, starting_snapshot_id)
+        if result == Result.VALIDATION_FAILED:
+           return result
+
+        if self.op.sql_op == SqlOpType.UPDATE:
+            result = self.ValidateNoNewDeletes(current_metadata, 
+                                               starting_snapshot_id)
+            if result == Result.VALIDATION_FAILED:
+                return result
+
+        if CONFIGURED_ISOLATION == Isolation.SERIALIZABLE:
+            result = self.ValidateAddedDataFiles(current_metadata, starting_snapshot_id)
+            if result == Result.VALIDATION_FAILED:
+                return result
+
+            return result
+        else:
+            return Result.OK
+
+    atomic func OverwriteValidation(current_metadata, starting_snapshot_id, parent_snapshot):
+        if parent_snapshot == None:
+            return Result.OK
+        
+        if CONFIGURED_ISOLATION == Isolation.SERIALIZABLE:
+            result = self.ValidateAddedDataFiles(current_metadata, starting_snapshot_id)
+            if result == Result.VALIDATION_FAILED:
+                return result
+
+        result = self.ValidateNoNewDeletesForDataFiles(current_metadata, 
+                                                       starting_snapshot_id,
+                                                       self.op.deleted_data_files)
+        return result
+
+    atomic func RewriteFilesValidation(current_metadata, starting_snapshot_id, parent_snapshot):
+        if parent_snapshot == None:
+            return Result.OK
+
+        result = self.ValidateNoNewDeletesForDataFiles(current_metadata, 
+                                                       starting_snapshot_id,
+                                                       self.op.deleted_data_files)
+        return result
+    
+    atomic func MergeManifestFiles(manifest_files, content, 
+                                   sequence_no, new_snapshot_id):
+        # Merges all input manifest files into a single manifest file.
+        # Filter out manifests with only deleted files from the parent snapshot.
+
+        unmerged_manifests = []
+        for manifest_file in manifest_files:
+            if (manifest_file.added_file_count > 0
+                    or manifest_file.existing_file_count > 0
+                    or manifest_file.snapshot_id == new_snapshot_id):
+                unmerged_manifests.append(manifest_file)
+        
+        # Merge the manifest files into a single manifest file.
+        # The implementation can create one or more merged manifests
+        # but this spec just merges all into one.
+        manifest_entries = []
+        added_count = 0
+        existing_count = 0
+        deleted_count = 0
+        min_seq_no = sequence_no
+        for unmerged in unmerged_manifests:
+            for entry in unmerged.entries:
+                if entry.status == ManifestEntryStatus.DELETED:
+                    if entry.snapshot_id == new_snapshot_id:
+                        manifest_entries.append(entry)
+                        deleted_count += 1
+                elif entry.status == ManifestEntryStatus.ADDED:
+                    manifest_entries.append(entry)
+                    added_count += 1
+                else:
+                    manifest_entries.append(entry)
+                    existing_count += 1
+
+                if entry.data_sequence_no < min_seq_no:
+                    min_seq_no = entry.data_sequence_no
+
+        merged_manifest = record(content = content,
+                                 entries = manifest_entries,
+                                 snapshot_id = new_snapshot_id,
+                                 sequence_no = sequence_no,
+                                 min_sequence_no = min_seq_no, 
+                                 added_file_count = added_count,
+                                 deleted_file_count = deleted_count,
+                                 existing_file_count = existing_count)
+        return merged_manifest
+
+    atomic func GenerateDataManifestFiles(data_manifest_list,
+                                          sequence_no,
+                                          new_snapshot_id):
+        # 1. Update existing data manifest entries so that their status reflects
+        #    the new snapshot. For example:
+        #      - ADDED in the parent shapshot becomes EXISTING.
+        #      - Any entries that were live in the parent snapshot 
+        #        but deleted in this snapshot become DELETED.
+        existing_data_manifests = []
+        min_data_seq_no = sequence_no
+        for manifest_file_entry in data_manifest_list:
+            manifest_file = object_store.Read(manifest_file_entry.manifest_path)
+            
+            for entry in manifest_file.entries:
+                if entry.status != ManifestEntryStatus.DELETED:
+                    if entry.data_file.file_path in self.op.deleted_data_files:
+                        entry.status = ManifestEntryStatus.DELETED
+                        entry.snapshot_id = new_snapshot_id
+                    else:
+                        entry.status = ManifestEntryStatus.EXISTING
+            
+            if manifest_file.min_sequence_no < min_data_seq_no:
+                min_data_seq_no = manifest_file.min_sequence_no
+            
+            existing_data_manifests.append(manifest_file)
+
+        # 2. Generate a new in-memory manifest file for added files of this transaction.
+        new_manifests = []
+        entries = []
+        added_count = 0
+                
+        # Add a new manifest entry for each added data file
+        for data_file_path in self.op.added_data_files:
+            data_file_rec = record(content = DataFileContent.DATA,
+                                   file_path = data_file_path)
+            entry = record(status = ManifestEntryStatus.ADDED,
+                           data_sequence_no = sequence_no, # set here because ADDED
+                           file_sequence_no = sequence_no, # set here because ADDED
+                           snapshot_id = new_snapshot_id,
+                           data_file = data_file_rec)
+            entries.append(entry)
+            added_count += 1
+
+        data_manifest = record(content = ManifestFileContent.DATA,
+                               entries = entries,
+                               snapshot_id = new_snapshot_id,
+                               sequence_no = sequence_no, # seq no when the manifest was created
+                               min_sequence_no = sequence_no, # min data seq no of any data files
+                               added_file_count = added_count,
+                               deleted_file_count = 0,
+                               existing_file_count = 0)
+        new_manifests.append(data_manifest)
+        
+        # 3. Merge the existing and new data manifest files
+        all_data_manifests = existing_data_manifests + new_manifests
+        merged_data_manifest = self.MergeManifestFiles(all_data_manifests,
+                                                       ManifestFileContent.DATA,
+                                                       sequence_no,
+                                                       new_snapshot_id)
+        file_path = ManifestFileName()
+        object_store.Write(file_path, merged_data_manifest)
+        self.op.metadata_files.append(file_path)
+
+        res = record(file_path = file_path,
+                     file = merged_data_manifest,
+                     min_data_seq_no = min_data_seq_no)
+        return res
+
+    atomic func GenerateDeleteManifestFiles(delete_manifest_list,
+                                            sequence_no,
+                                            min_data_seq_no,
+                                            new_snapshot_id):
+        # 1. Update any delete manifest entries that need to be deleted
+        #    because their data sequence number is lower than any live
+        #    entries in the new snapshot.
+        existing_delete_manifests = []
+        min_del_seq_no = sequence_no
+        for manifest_file_entry in delete_manifest_list:
+            manifest_file = object_store.Read(manifest_file_entry.manifest_path)
+            for entry in manifest_file.entries:
+                if entry.status != ManifestEntryStatus.DELETED:
+                    if (manifest_file.content == ManifestFileContent.DELETES
+                            and (entry.status == ManifestEntryStatus.ADDED
+                                 or entry.status == ManifestEntryStatus.EXISTING)
+                            and entry.data_sequence_no > 0
+                            and entry.data_sequence_no < min_data_seq_no):
+                        entry.status = ManifestEntryStatus.DELETED
+                    else:
+                        entry.status = ManifestEntryStatus.EXISTING
+            existing_delete_manifests.append(manifest_file)
+
+        # 2. Generate a new in-memory manifest file for the added delete files of this transaction.
+        new_manifests = []
+        entries = []
+        added_count = 0
+                  
+        for del_file_path in self.op.added_delete_files:
+            del_file_rec = record(content = DataFileContent.POS_DELETE,
+                                  file_path = del_file_path)
+            entry = record(status = ManifestEntryStatus.ADDED,
+                           data_sequence_no = sequence_no,
+                           file_sequence_no = sequence_no,
+                           snapshot_id = new_snapshot_id,
+                           data_file = del_file_rec)
+            entries.append(entry)
+            added_count += 1
+                
+        del_manifest = record(content = ManifestFileContent.DELETES,
+                              entries = entries,
+                              snapshot_id = new_snapshot_id,
+                              sequence_no = sequence_no, # seq no when the manifest was created
+                              min_sequence_no = sequence_no, # min data seq no of any data files
+                              added_file_count = added_count,
+                              deleted_file_count = 0,
+                              existing_file_count = 0)
+        new_manifests.append(del_manifest)
+
+        # 3. Merge the existing and new delete manifest files
+        all_delete_manifests = existing_delete_manifests + new_manifests
+        merged_delete_manifest = self.MergeManifestFiles(all_delete_manifests,
+                                                         ManifestFileContent.DELETES,
+                                                         sequence_no,
+                                                         new_snapshot_id)
+        file_path = ManifestFileName()
+        object_store.Write(file_path, merged_delete_manifest)
+        self.op.metadata_files.append(file_path)
+
+        res = record(file_path = file_path,
+                     file = merged_delete_manifest)
+        return res
+
+    atomic fair action WriteMetadataFiles:
+        # Writes all the metadata files (manifests, manifest list and metadata file)
+        # without performing the commit against the catalog.
+
+        require self.op.state == State.WRITE_METADATA_FILES
+
+        op = self.op
+
+        # 1. Load current metadata
+        location = catalog.CurrentMetadataLocation()
+        current_metadata = object_store.Read(location)
+
+        # 2. Get parent snapshot
+        sequence_no = current_metadata.last_sequence_no + 1 if current_metadata != None else 1
+        parent_snapshot = current_metadata.current_snapshot if current_metadata != None else None
+        new_snapshot_id = aux_snapshot_id + 1
+
+        curr_manifest_list = []
+        if current_metadata != None:
+            curr_manifest_list = object_store.Read(parent_snapshot.manifest_list_path)
+        data_manifest_list = []
+        delete_manifest_list = []
+        for entry in curr_manifest_list:
+            if entry.content == ManifestFileContent.DATA:
+                data_manifest_list.append(entry)
+            else:
+                delete_manifest_list.append(entry)
+
+        # 3. Validate (various conflict detections)
+        validation_res = None
+        if current_metadata == None:
+            validation_res = Result.OK
+        elif self.op.snapshot_update == SnapshotUpdateType.MERGE_APPEND:
+            validation_res = self.MergeAppendValidation(current_metadata, self.op.scan_snapshot_id, parent_snapshot)
+        elif self.op.snapshot_update == SnapshotUpdateType.ROW_DELTA:
+            validation_res = self.RowDeltaValidation(current_metadata, self.op.scan_snapshot_id, parent_snapshot)
+        elif self.op.snapshot_update == SnapshotUpdateType.OVERWRITE_FILES:
+            validation_res = self.OverwriteValidation(current_metadata, self.op.scan_snapshot_id, parent_snapshot)
+        elif self.op.snapshot_update == SnapshotUpdateType.REWRITE_FILES:
+            validation_res = self.RewriteFilesValidation(current_metadata, self.op.scan_snapshot_id, parent_snapshot)
+
+        if validation_res == Result.VALIDATION_FAILED:
+            # Abort and clean-up
+            aux_abort_count += 1
+            for file_path in self.op.metadata_files:
+                object_store.Delete(file_path)
+            reset_op = record(state = State.ABORTED)
+            self.op = reset_op
+            return
+
+        # 4. Generate manifest files. This spec merges all data manifests
+        #    into one manifest file, and the same for delete manifests,
+        #    which are only created when merge-on-read is used.
+        manifest_res = []
+        data_res = self.GenerateDataManifestFiles(data_manifest_list,
+                                                  sequence_no,
+                                                  new_snapshot_id)
+        manifest_res.append(data_res)
+
+        if len(self.op.added_delete_files) > 0 or len(delete_manifest_list) > 0:
+            delete_res = self.GenerateDeleteManifestFiles(delete_manifest_list,
+                                                            sequence_no,
+                                                            data_res.min_data_seq_no,
+                                                            new_snapshot_id)
+            manifest_res.append(delete_res)
+
+        # 5. Create manifest list
+        new_manifest_list = []
+        for res in manifest_res:
+            m = record(manifest_path = res.file_path,
+                       content = res.file.content,
+                       sequence_no = res.file.sequence_no,
+                       min_sequence_no = res.file.min_sequence_no,
+                       snapshot_id = new_snapshot_id,
+                       added_file_count = res.file.added_file_count,
+                       deleted_file_count = res.file.deleted_file_count,
+                       existing_file_count = res.file.existing_file_count)
+            new_manifest_list.append(m)
+
+        manifest_list_file_path = ManifestListFileName()
+        object_store.Write(manifest_list_file_path, new_manifest_list)
+        op.metadata_files.append(manifest_list_file_path)
+
+        # 6. Create new snapshot
+        parent_snapshot_id = parent_snapshot.snapshot_id if parent_snapshot != None else None
+        new_snapshot = record(sequence_no = sequence_no,
+                              snapshot_id = new_snapshot_id,
+                              parent_snapshot_id = parent_snapshot_id,
+                              operation = self.op.data_op,
+                              manifest_list_path = manifest_list_file_path)
+
+        # 7. Create new table metadata object
+        new_version = current_metadata.version + 1 if current_metadata != None else 1
+        new_location = MetadataFileName(new_version)
+        new_snapshots = current_metadata.snapshots if current_metadata != None else []
+        new_snapshots.append(new_snapshot)
+        new_metadata = record(location = new_location,
+                              version = new_version,
+                              current_snapshot = new_snapshot,
+                              snapshots = new_snapshots,
+                              last_sequence_no = sequence_no)
+        object_store.Write(new_location, new_metadata)
+        op.metadata_files.append(new_location)
+        
+        op.old_metadata_location = current_metadata.location if current_metadata != None else None
+        op.new_metadata_location = new_metadata.location
+        op.version = new_version
+        op.state = State.COMMIT
+        self.op = op
+        aux_snapshot_id += 1
+
+    atomic fair action Commit:
+        # Performs the commit against the catalog. If the commit is rejected,
+        # the writer cleans up the metadata files and returns to the WRITE_METADATA_FILES
+        # state to retry the operation.
+
+        require self.op.state == State.COMMIT
+
+        result = catalog.Commit(self.op.old_metadata_location, 
+                                self.op.new_metadata_location)
+        if result == Result.OK:
+            if self.op.data_op != DataOp.REPLACE:
+                RecordHistory(self.op.version, self.op.sql_op,
+                              self.op.row_history, self.op.set_values)
+            
+            if self.op.version > aux_max_version:
+                aux_max_version = self.op.version
+                aux_version_loc[self.op.version] = self.op.new_metadata_location
+
+            reset_op = record(state = State.COMMITTED)
+            self.op = reset_op
+        else:
+            for file_path in self.op.metadata_files:
+                object_store.Delete(file_path)
+            
+            self.op.old_metadata_location = None
+            self.op.new_metadata_location = None
+            self.op.state = State.WRITE_METADATA_FILES
+
+# ----------------------------------------------
+# CATALOG role
+# ----------------------------------------------        
+
+role Catalog:
+    atomic action Init:
+        self.metadata_location = None
+    
+    atomic func CurrentMetadataLocation():
+        return self.metadata_location
+
+    atomic func Commit(old_location, new_location):
+        if old_location == None:
+            if self.metadata_location == None:
+                self.metadata_location = new_location
+                return Result.OK
+            else:
+                return Result.COMMIT_FAILED
+        elif old_location != self.metadata_location:
+            return Result.COMMIT_FAILED
+        else:
+            self.metadata_location = new_location
+            return Result.OK
+
+# ----------------------------------------------
+# OBJECT STORE role
+# ----------------------------------------------
+
+role ObjectStore:
+    atomic action Init:
+        # map of file id -> file
+        self.objects = {}
+    
+    atomic func List(prefix):
+        matches = []
+
+        for file_id in self.objects:
+            if file_id.startswith(prefix):
+                matches.append(file_id)
+
+        return matches
+
+    atomic func Read(file_id):
+        if file_id in self.objects:
+            obj = self.objects[file_id]
+            obj_copy = deepcopy(obj)
+            return obj_copy
+        else:
+            return None
+
+    atomic func Delete(file_id):
+        if file_id in self.objects:
+            self.objects.pop(file_id)
+    
+    atomic func Write(file_id, file):
+        self.objects[file_id] = file
+
+# ----------------------------------------------
+# Safety properties
+# ----------------------------------------------
+
+always assertion TestInv:
+    return True
+
+always assertion SequentialSequenceNumbers:
+    # There should be no gaps in the sequence numbering.
+    metadata_file_ids = object_store.List("metadata")
+    
+    for file_id in metadata_file_ids:
+        metadata = object_store.Read(file_id)
+        expected_seq_no = 1
+        for snapshot in metadata.snapshots:
+            if snapshot.sequence_no != expected_seq_no:
+                print("INVARIANT VIOLATION! Non-sequential sequence numbers!")
+                return False
+            expected_seq_no += 1
+
+    return True
+
+always assertion ConsistentRead:
+    # For every possible row (id column value), column and version, check that the linearized history
+    # (aux_key_col_log) matches reads based on metadata and data files in object storage.
+    
+    for id_col in Col1Values:
+        for col in range(1, 3):
+            for version in range(1, aux_max_version+1):
+                metadata_location = aux_version_loc[version]
+                model_value = ReadColFromHistoryModel(version, id_col, col)
+                scan_result = Scan(metadata_location, [id_col, None, None])
+
+                if len(scan_result) > 1 or (len(scan_result) == 1 and len(scan_result[0].rows) > 1):
+                    # if would mean there are duplicates which is a violation of this spec
+                    return False
+
+                # this is a lookup by id column, there should be only one row
+                actual_row = scan_result[0].rows[0].row if len(scan_result) == 1 else None
+                
+                if model_value == None and actual_row == None:
+                    continue
+                elif model_value == None and actual_row != None:
+                    print("CONSISTENCY VIOLATION!")
+                    print("id_col: " + str(id_col) + ", col: " + str(col) + ", version: " + str(version)
+                            + ", expected: None"
+                            + ", actual: " + str(actual_row[col])
+                            + ", actual row: " + str(actual_row))
+                    return False
+                elif model_value != None and actual_row == None:
+                    print("Consistency violation!")
+                    print("id_col: " + str(id_col) + ", col: " + str(col) + ", version: " + str(version)
+                            + ", expected: " + str(model_value)
+                            + ", actual: None"
+                            + ", actual row: None")
+                    return False
+                elif model_value != actual_row[col]:
+                    print("Consistency violation!")
+                    print("id_col: " + str(id_col) + ", col: " + str(col) + ", version: " + str(version)
+                            + ", expected: " + str(model_value)
+                            + ", actual: " + str(actual_row[col])
+                            + ", actual row: " + str(actual_row))
+                    return False
+
+    return True
+
+# ----------------------------------------------
+# Liveness properties
+# ----------------------------------------------
+
+eventually always assertion OperationsEventuallyCommitOrAbort:
+    for writer in writers:
+        if writer.op.state not in [State.READY, State.COMMITTED, State.ABORTED]:
+            return False
+
+    return True
+            
+
+eventually always assertion AllSnapshotsCommitted:
+    metadata = CurrentMetadata()
+    if metadata == None:
+        return False
+
+    completed = len(metadata.snapshots) + aux_abort_count
+    
+    return (completed == MAX_WRITE_OPS + MAX_COMPACTION_OPS
+            and metadata.version == len(metadata.snapshots))
+
+# ----------------------------------------------
+# Init
+# ----------------------------------------------
+
+atomic action Init:
+    aux_op_count = 0                    # used to track number of write operations
+    aux_compaction_count = 0            # used to track number of compactions
+    aux_abort_count = 0                 # used to track number of aborts (necessary for liveness checks)
+    aux_file_id = {}                    # used to generate unique file names
+    aux_file_id['data'] = 0
+    aux_file_id['delete'] = 0
+    aux_file_id['manifest'] = 0
+    aux_file_id['manifestlist'] = 0
+    aux_md_uuid = {}                    # used to generate unique metadata file names
+    aux_max_version = 0                 # used to track the max committed version (used in safety properties)
+    aux_key_col_log = {}                # a linearized history of column values used in safety properties
+    aux_snapshot_id = 0                 # used to generate unique snapshot ids
+    aux_key_insert_pending = set()      # used to track pending inserts, to avoid duplicate inserts
+    aux_version_loc = {}                # used to track the metadata location of each version (used in safety properties)
+    
+    object_store = ObjectStore()
+    catalog = Catalog()
+    writers = []
+    w_ctr = 0
+    for i in range(NUM_WRITERS):
+        w = Writer(ID=w_ctr)
+        writers.append(w)
+        w_ctr += 1
