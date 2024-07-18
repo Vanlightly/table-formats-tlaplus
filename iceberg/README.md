@@ -45,36 +45,42 @@ Snapshot isolation should in theory not cause a consistency violation, but Icebe
 
 ### Serializable + Concurrent delete/compaction + COW
 
-The Fizzbee spec has detected a consistency violation with the Serializable isolation level when used in conjunction with COW and compaction.
+The Fizzbee spec has detected a consistency violation with the Serializable isolation level when used in conjunction with COW and compaction. Assumes an empty table with `metadata-0`.
 
 1. Writer 0: Step=StartInsert. Insert row `['jack', 'red', 'A']`.
-2. Writer 0: Step=WriteDataFiles. Write `data-0` with `rows=[['jack', 'red', 'A']]`.
+2. Writer 0: Step=WriteDataFiles. Write `data-1` with `rows=[['jack', 'red', 'A']]`.
 3. Writer 0: Step=WriteMetadataFiles:
-    a. Manifest: `manifest-0` with `data-0` added.
-    b. Manifest-list: `manifest-list-0` with `manifest-0`.
-    c. Metadata: `metadata-0-uuid0` with snapshot 1 containing `manifest-list-0`.
-4. Writer 0: Step=Commit. Current location=`metadata-0-uuid0`.
-5. Writer 0: Step=StartDelete. Delete of row with id column = 'jack', table version 1. Starting snapshot=current snapshot of `metadata-0-uuid0`.
-6. Writer 0: Step=ReadDataFiles, identifying `data-0` to be deleted.
-7. Writer 1: Step=StartCompaction, at table version 1. Starting snapshot=current snapshot of `metadata-0-uuid0`.
-7. Writer 0: Step=WriteDataFiles. Writes `data-1` with the contents of `data-0` with the 'jack' row removed, `rows=[]`.
-8. Writer 0. Step=WriteMetadataFiles. Loads metadata `metadata-0-uuid0`.
-    a. Manifest: `manifest-1` with `data-0` removed and `data-1` added.
-    b. Manifest-list: `manifest-list-1` with `manifest-1`.
-    c. Metadata: `metadata-1-uuid1` with snapshot 1 containing `manifest-list-1`.
+    a. Refresh metadata (`metadata-0`).
+    b. Perform validation.
+    c. Manifest: `manifest-1` with `data-1` added.
+    d. Manifest-list: `manifest-list-1` with `manifest-1`.
+    e. Metadata: `metadata-1` with `snapshot-1` containing `manifest-list-1`.
+5. Writer 0: Step=Commit. Swap `metadata-0` with `metadata-1` which succeeds.
+6. Writer 0: Step=StartDeleteOperation. Delete of row with id column = 'jack', table version 1. Starting snapshot=`snapshot-1` of `metadata-1`.
+7. Writer 0: Step=ReadDataFiles, identifying `data-1` to be deleted.
+8. Writer 1: Step=StartCompaction, at table version 1. Starting snapshot=`snapshot-1` of `metadata-1`.
+7. Writer 0: Step=WriteDataFiles. Writes `data-2` with the contents of `data-1` with the 'jack' row removed, `data-2: rows=[]`.
+8. Writer 0. Step=WriteMetadataFiles.
+    a. Refresh metadata (`metadata-1`)
+    b. Perform validation, from the starting snapshot of snapshot-1.
+    c. Manifest: `manifest-2` with `data-1` removed and `data-2` added.
+    d. Manifest-list: `manifest-list-2` with `manifest-2`.
+    e. Metadata: `metadata-2` with `snapshot-2` containing `manifest-list-2`.
 10. Writer 1: Step=ReadDataFiles. Perform a table scan, returning one row `['jack', 'red', 'A']`.
-11. Writer 1: Step=WriteDataFiles. Write table scan results to a new data file, `data-2` with `rows=[['jack', 'red', 'A']]`.
-12. Writer 0: Step=Commit. Current location=`metadata-1-uuid1`.
-13. Writer 1: Step=WriteMetadataFiles. Loads metadata `metadata-1-uuid1`.
-    a. Manifest: `manifest-2` with `data-1` existing and `data-2` added. `data-0` was listed as deleted already, so gets filtered out of the manifest.
-    b. Manifest-list: `manifest-list-2` with `manifest-2`.
-    c. Metadata: `metadata-2-uuid2` with current snapshot containing `manifest-list-2`.
-14. Writer 1: Step=Commit. Current location=`metadata-2-uuid2`.
+11. Writer 1: Step=WriteDataFiles. Write table scan results to a new data file, `data-3` with `rows=[['jack', 'red', 'A']]`.
+12. Writer 0: Step=Commit. Swap `metadata-1` with `metadata-2` which succeeds.
+13. Writer 1: Step=WriteMetadataFiles.
+    a. Refresh metadata (`metadata-2`)
+    b. Perform validation
+    c. Manifest: `manifest-3` with `data-2` existing and `data-3` added. `data-1` was listed as deleted already, so gets filtered out of the manifest.
+    d. Manifest-list: `manifest-list-3` with `manifest-3`.
+    e. Metadata: `metadata-3` with `snapshot-3` containing `manifest-list-3`.
+15. Writer 1: Step=Commit. Swap `metadata-2` with `metadata-3` which succeeds.
 
 At this point a table scan will return `['jack', 'red', 'A']`, despite the successful delete.
 
-Thus, an insert of `['jack', 'red', 'A']`, followed by a concurrent delete of row `['jack', 'red', 'A']` and a compaction, results in the undeleting of row `['jack', 'red', 'A']`.
+Thus, an insert of `['jack', 'red', 'A']`, followed by a concurrent delete of row `['jack', 'red', 'A']` and a compaction, can result in the undeleting of row `['jack', 'red', 'A']`.
 
-The compaction currently only checks for conflicting deletes using MOR mode (i.e. it looks for conflicting delete files). With COW, no such delete files are added and so the compaction is allowed to commit.
+The BaseRewriteFiles validation method (https://github.com/apache/iceberg/blob/bc72b2ee6b14e83eff6a49bc664c09259e5bb1c8/core/src/main/java/org/apache/iceberg/BaseRewriteFiles.java#L135) currently only checks for conflicting delete files (MOR mode). With COW, no such delete files are added and so the validation passes and the compaction is allowed to commit.
 
 THIS SHOULD BE CHECKED BY AN ICEBERG COMMITTER.
