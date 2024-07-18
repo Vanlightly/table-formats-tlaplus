@@ -278,8 +278,8 @@ role Writer:
         require aux_op_count < MAX_WRITE_OPS
 
         scan_metadata = CurrentMetadata()
-        scan_location = scan_metadata.location if scan_metadata != None else None
-        scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id if scan_metadata != None else 0
+        scan_location = scan_metadata.location
+        scan_snapshot_id = scan_metadata.current_snapshot.snapshot_id if scan_metadata.current_snapshot != None else 0
 
         id_col = any Col1Values
                     
@@ -334,7 +334,7 @@ role Writer:
         set_values = [None, None, None]
 
         scan_metadata = CurrentMetadata()
-        require scan_metadata != None
+        require scan_metadata.current_snapshot != None
                 
         snapshot_update_type = None
         if CONFIGURED_TABLE_MODE == TableMode.COPY_ON_WRITE:
@@ -428,8 +428,10 @@ role Writer:
         require self.op.state in [State.READY, State.COMMITTED, State.ABORTED]
         require aux_compaction_count < MAX_COMPACTION_OPS
         
+        # Constrain the spec to start a compaction only after there has been
+        # some data added
         scan_metadata = CurrentMetadata()
-        require scan_metadata != None
+        require scan_metadata.current_snapshot != None
 
         self.op = record(data_op = DataOp.REPLACE,
                          sql_op = SqlOpType.NOOP,
@@ -718,6 +720,9 @@ role Writer:
         return Result.OK
 
     atomic func RowDeltaValidation(current_metadata, starting_snapshot_id, parent_snapshot):
+        if parent_snapshot == None:
+            return Result.OK
+        
         result = self.ValidateDataFilesExist(current_metadata, starting_snapshot_id)
         if result == Result.VALIDATION_FAILED:
            return result
@@ -950,12 +955,12 @@ role Writer:
         current_metadata = object_store.Read(location)
 
         # 2. Get parent snapshot
-        sequence_no = current_metadata.last_sequence_no + 1 if current_metadata != None else 1
-        parent_snapshot = current_metadata.current_snapshot if current_metadata != None else None
+        sequence_no = current_metadata.last_sequence_no + 1
+        parent_snapshot = current_metadata.current_snapshot
         new_snapshot_id = aux_snapshot_id + 1
 
         curr_manifest_list = []
-        if current_metadata != None:
+        if parent_snapshot != None:
             curr_manifest_list = object_store.Read(parent_snapshot.manifest_list_path)
         data_manifest_list = []
         delete_manifest_list = []
@@ -1029,9 +1034,9 @@ role Writer:
                               manifest_list_path = manifest_list_file_path)
 
         # 7. Create new table metadata object
-        new_version = current_metadata.version + 1 if current_metadata != None else 1
+        new_version = current_metadata.version + 1
         new_location = MetadataFileName(new_version)
-        new_snapshots = current_metadata.snapshots if current_metadata != None else []
+        new_snapshots = current_metadata.snapshots
         new_snapshots.append(new_snapshot)
         new_metadata = record(location = new_location,
                               version = new_version,
@@ -1082,7 +1087,7 @@ role Writer:
 
 role Catalog:
     atomic action Init:
-        self.metadata_location = None
+        self.metadata_location = 'metadata-0'
     
     atomic func CurrentMetadataLocation():
         return self.metadata_location
@@ -1108,6 +1113,12 @@ role ObjectStore:
     atomic action Init:
         # map of file id -> file
         self.objects = {}
+        # start off with an essentially empty metadata after
+        # the table has been created. This spec doesn't model
+        # schema stuff
+        empty_md = record(location='metadata-0', version=0, current_snapshot = None,
+                          snapshots = [], last_sequence_no = 0)
+        self.objects['metadata-0'] = empty_md
     
     atomic func List(prefix):
         matches = []
@@ -1230,10 +1241,10 @@ atomic action Init:
     aux_compaction_count = 0            # used to track number of compactions
     aux_abort_count = 0                 # used to track number of aborts (necessary for liveness checks)
     aux_file_id = {}                    # used to generate unique file names
-    aux_file_id['data'] = 0
-    aux_file_id['delete'] = 0
-    aux_file_id['manifest'] = 0
-    aux_file_id['manifestlist'] = 0
+    aux_file_id['data'] = 1
+    aux_file_id['delete'] = 1
+    aux_file_id['manifest'] = 1
+    aux_file_id['manifestlist'] = 1
     aux_md_uuid = {}                    # used to generate unique metadata file names
     aux_max_version = 0                 # used to track the max committed version (used in safety properties)
     aux_key_col_log = {}                # a linearized history of column values used in safety properties
