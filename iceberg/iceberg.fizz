@@ -756,6 +756,13 @@ role Writer:
                                                        self.op.deleted_data_files)
         return result
 
+    atomic func ValidateDeletedFilesGotDeleted(actual_deleted_files, deleted_data_files):
+        for deleted_file in deleted_data_files:
+            if deleted_file not in actual_deleted_files:
+                return Result.VALIDATION_FAILED
+
+        return Result.OK
+
     atomic func RewriteFilesValidation(current_metadata, starting_snapshot_id, parent_snapshot):
         if parent_snapshot == None:
             return Result.OK
@@ -818,7 +825,9 @@ role Writer:
         #    the new snapshot. For example:
         #      - ADDED in the parent shapshot becomes EXISTING.
         #      - Any entries that were live in the parent snapshot 
-        #        but deleted in this snapshot become DELETED.
+        #        but deleted in this snapshot become DELETED and gets added
+        #        to a deleted path set.
+        actual_deleted_files = set()
         existing_data_manifests = []
         min_data_seq_no = sequence_no
         for manifest_file_entry in data_manifest_list:
@@ -829,6 +838,7 @@ role Writer:
                     if entry.data_file.file_path in self.op.deleted_data_files:
                         entry.status = ManifestEntryStatus.DELETED
                         entry.snapshot_id = new_snapshot_id
+                        actual_deleted_files.add(entry.data_file.file_path)
                     else:
                         entry.status = ManifestEntryStatus.EXISTING
             
@@ -876,8 +886,17 @@ role Writer:
 
         res = record(file_path = file_path,
                      file = merged_data_manifest,
-                     min_data_seq_no = min_data_seq_no)
+                     min_data_seq_no = min_data_seq_no,
+                     actual_deleted_files = actual_deleted_files)
         return res
+
+    atomic func Abort():
+        # Abort and clean-up
+        aux_abort_count += 1
+        for file_path in self.op.metadata_files:
+            object_store.Delete(file_path)
+        reset_op = record(state = State.ABORTED)
+        self.op = reset_op
 
     atomic func GenerateDeleteManifestFiles(delete_manifest_list,
                                             sequence_no,
@@ -886,6 +905,7 @@ role Writer:
         # 1. Update any delete manifest entries that need to be deleted
         #    because their data sequence number is lower than any live
         #    entries in the new snapshot.
+        actual_deleted_files = set()
         existing_delete_manifests = []
         min_del_seq_no = sequence_no
         for manifest_file_entry in delete_manifest_list:
@@ -898,6 +918,7 @@ role Writer:
                             and entry.data_sequence_no > 0
                             and entry.data_sequence_no < min_data_seq_no):
                         entry.status = ManifestEntryStatus.DELETED
+                        actual_deleted_files.add(entry.data_file.file_path)
                     else:
                         entry.status = ManifestEntryStatus.EXISTING
             existing_delete_manifests.append(manifest_file)
@@ -939,7 +960,8 @@ role Writer:
         self.op.metadata_files.append(file_path)
 
         res = record(file_path = file_path,
-                     file = merged_delete_manifest)
+                     file = merged_delete_manifest,
+                     actual_deleted_files = actual_deleted_files)
         return res
 
     atomic fair action WriteMetadataFiles:
@@ -984,12 +1006,7 @@ role Writer:
             validation_res = self.RewriteFilesValidation(current_metadata, self.op.scan_snapshot_id, parent_snapshot)
 
         if validation_res == Result.VALIDATION_FAILED:
-            # Abort and clean-up
-            aux_abort_count += 1
-            for file_path in self.op.metadata_files:
-                object_store.Delete(file_path)
-            reset_op = record(state = State.ABORTED)
-            self.op = reset_op
+            self.Abort()
             return
 
         # 4. Generate manifest files. This spec merges all data manifests
@@ -999,6 +1016,15 @@ role Writer:
         data_res = self.GenerateDataManifestFiles(data_manifest_list,
                                                   sequence_no,
                                                   new_snapshot_id)
+        
+        if (self.op.snapshot_update == SnapshotUpdateType.OVERWRITE_FILES
+                or self.op.snapshot_update == SnapshotUpdateType.REWRITE_FILES):
+            validation_res = self.ValidateDeletedFilesGotDeleted(data_res.actual_deleted_files, 
+                                                                 self.op.deleted_data_files)
+            if validation_res == Result.VALIDATION_FAILED:
+                self.Abort()
+                return
+
         manifest_res.append(data_res)
 
         if len(self.op.added_delete_files) > 0 or len(delete_manifest_list) > 0:
@@ -1006,6 +1032,17 @@ role Writer:
                                                             sequence_no,
                                                             data_res.min_data_seq_no,
                                                             new_snapshot_id)
+            
+
+            if (self.op.snapshot_update == SnapshotUpdateType.REWRITE_FILES):
+                # Not currently modeled as this only occurs for a deleted file compaction which
+                # this spec does not support.
+                validation_res = self.ValidateDeletedFilesGotDeleted(data_res.actual_deleted_files, 
+                                                                     self.op.deleted_delete_files)
+                if validation_res == Result.VALIDATION_FAILED:
+                    self.Abort()
+                    return
+
             manifest_res.append(delete_res)
 
         # 5. Create manifest list
