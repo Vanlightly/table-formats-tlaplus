@@ -9,7 +9,9 @@
 # and the workload does not introduce duplicate rows.
 
 # This is entirely reverse engineered from the code, so many
-# concepts in the code are represented here.
+# concepts in the code are represented here. Because it tries
+# to represent the validation (conflict detection) logic in a 
+# similar structure to the code, the validation logic is quite long.
 
 # See the README.md for a description of the spec.
 
@@ -18,17 +20,17 @@
 # ----------------------------------------------
 
 TableMode = enum('COPY_ON_WRITE', 'MERGE_ON_READ')
-CONFIGURED_TABLE_MODE = TableMode.COPY_ON_WRITE
+CONFIGURED_TABLE_MODE = TableMode.MERGE_ON_READ
 
 Isolation = enum('SERIALIZABLE', 'SNAPSHOT_ISOLATION')
-CONFIGURED_ISOLATION = Isolation.SERIALIZABLE
+CONFIGURED_ISOLATION = Isolation.SNAPSHOT_ISOLATION
 NUM_WRITERS = 2
 
 # State space limiting constants
 ALLOW_UPDATES = True               # Include update queries
 ALLOW_DELETES = True               # Include delete queries
 MAX_WRITE_OPS = 3                  # The max number of write operations
-MAX_COMPACTION_OPS = 1             # The max number of compactions
+MAX_COMPACTION_OPS = 0             # The max number of compactions
 
 # Column values, each col1 value represents a possible row in the table.
 # Col 1 values are not duplicated, so if there are 2 values then there are 2 possible rows.
@@ -665,6 +667,29 @@ role Writer:
 
         return delete_files
 
+    atomic func ValidateDeletedDataFiles(current_metadata, starting_snapshot_id):
+        # If any data files were deleted since the starting snapshot, then validation fails.
+        # Only called when a delete expression is pushed down into Iceberg, which this
+        # spec does not currently model. Keeping this in case I add delete expressions.
+
+        history = self.GetValidationHistory(current_metadata, starting_snapshot_id,
+                                            [DataOp.DELETE, DataOp.OVERWRITE, DataOp.REPLACE],
+                                            ManifestFileContent.DATA)
+
+        # In the code: ignoreExisting()
+        entries = []
+        for manifest in history.manifests:
+            if manifest.added_file_count > 0 or manifest.deleted_file_count > 0:
+                for entry in manifest.entries:
+                    if (entry.status == ManifestEntryStatus.DELETED
+                            and entry.snapshot_id in history.snapshots):
+                        entries.append(entry)
+
+        if len(entries) > 0:
+            return Result.VALIDATION_FAILED
+
+        return Result.OK
+
     atomic func ValidateNoNewDeletesForDataFiles(current_metadata, starting_snapshot_id, 
                                                  deleted_data_files):
         # If any delete files were added after the starting snapshot, that reference one
@@ -751,6 +776,12 @@ role Writer:
             if result == Result.VALIDATION_FAILED:
                 return result
 
+        # This is called when a delete expression is used instead of explicitly adding
+        # deleted file paths to the self.op.deleted_data_files. I'm leaving this commented out, 
+        # as this spec explicitly adds deleted files and doesn't use delete expressions.
+        # The other ValidateDeletedFilesGotDeleted validation makes this check not needed.
+        # result = self.ValidateDeletedDataFiles(current_metadata, starting_snapshot_id)
+
         result = self.ValidateNoNewDeletesForDataFiles(current_metadata, 
                                                        starting_snapshot_id,
                                                        self.op.deleted_data_files)
@@ -826,7 +857,7 @@ role Writer:
         #      - ADDED in the parent shapshot becomes EXISTING.
         #      - Any entries that were live in the parent snapshot 
         #        but deleted in this snapshot become DELETED and gets added
-        #        to a deleted path set.
+        #        to the actual_deleted_files set which forms part of validation.
         actual_deleted_files = set()
         existing_data_manifests = []
         min_data_seq_no = sequence_no
