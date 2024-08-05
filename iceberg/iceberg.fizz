@@ -19,8 +19,14 @@
 # Constants
 # ----------------------------------------------
 
+# MERGE command not supported
 TableMode = enum('COPY_ON_WRITE', 'MERGE_ON_READ')
+<<<<<<< Updated upstream
 CONFIGURED_TABLE_MODE = TableMode.MERGE_ON_READ
+=======
+UPDATE_MODE = TableMode.MERGE_ON_READ
+DELETE_MODE = TableMode.MERGE_ON_READ
+>>>>>>> Stashed changes
 
 Isolation = enum('SERIALIZABLE', 'SNAPSHOT_ISOLATION')
 CONFIGURED_ISOLATION = Isolation.SNAPSHOT_ISOLATION
@@ -240,9 +246,7 @@ atomic func Scan(metadata_location, predicate):
     if metadata == None:
         return scan
 
-    delete_files = []
-    if CONFIGURED_TABLE_MODE == TableMode.MERGE_ON_READ:
-        delete_files = GetDeleteFiles(metadata)
+    delete_files = GetDeleteFiles(metadata)
 
     manifest_list = object_store.Read(metadata.current_snapshot.manifest_list_path)
     for entry in manifest_list:
@@ -339,7 +343,7 @@ role Writer:
         require scan_metadata.current_snapshot != None
                 
         snapshot_update_type = None
-        if CONFIGURED_TABLE_MODE == TableMode.COPY_ON_WRITE:
+        if DELETE_MODE == TableMode.COPY_ON_WRITE:
             snapshot_update_type = SnapshotUpdateType.OVERWRITE_FILES
         else:
             snapshot_update_type = SnapshotUpdateType.ROW_DELTA
@@ -405,7 +409,7 @@ role Writer:
                 require matching_rows != update_rows
 
         snapshot_update_type = None
-        if CONFIGURED_TABLE_MODE == TableMode.COPY_ON_WRITE:
+        if UPDATE_MODE == TableMode.COPY_ON_WRITE:
             snapshot_update_type = SnapshotUpdateType.OVERWRITE_FILES
         else:
             snapshot_update_type = SnapshotUpdateType.ROW_DELTA
@@ -1233,6 +1237,38 @@ always assertion SequentialSequenceNumbers:
             expected_seq_no += 1
 
     return True
+
+atomic func DataFileExists(metadata, file_path):
+    manifest_list = object_store.Read(metadata.current_snapshot.manifest_list_path)
+    for entry in manifest_list:
+        manifest_file = object_store.Read(entry.manifest_path)        
+        
+        for entry in manifest_file.entries:
+            if (entry.data_file.content == DataFileContent.DATA
+                    and (entry.status == ManifestEntryStatus.ADDED
+                         or entry.status == ManifestEntryStatus.EXISTING)):
+                if file_path == entry.data_file.file_path:
+                    return True
+    
+    return False
+
+always assertion NoDanglingDeleteFiles:
+    # Every entry in every delete file references a live data file
+    metadata = CurrentMetadata()
+
+    if metadata.current_snapshot != None:
+        delete_files = GetDeleteFiles(metadata)
+        for file in delete_files:
+            for del_entry in file.delete_file:
+                data_file_path = del_entry[0]
+                exists = DataFileExists(metadata, data_file_path)
+                if not exists:
+                    print("INVARIANT VIOLATION! Dangling delete file entry: " + str(del_entry))
+                    return False
+
+    return True
+                
+
 
 always assertion ConsistentRead:
     # For every possible row (id column value), column and version, check that the linearized history

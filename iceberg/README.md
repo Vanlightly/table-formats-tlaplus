@@ -59,7 +59,11 @@ History of FavColor column for row with id 'jack':
 Model parameters:
 
 ```
-CONFIGURED_TABLE_MODE = TableMode.MERGE_ON_READ
+TableMode = enum('COPY_ON_WRITE', 'MERGE_ON_READ')
+UPDATE_MODE = TableMode.MERGE_ON_READ
+DELETE_MODE = TableMode.MERGE_ON_READ
+
+Isolation = enum('SERIALIZABLE', 'SNAPSHOT_ISOLATION')
 CONFIGURED_ISOLATION = Isolation.SNAPSHOT_ISOLATION
 NUM_WRITERS = 2
 
@@ -109,7 +113,7 @@ Steps:
     6. Write a new metadata file `metadata-3` with `snapshot-3` containing `manifest-list-3`.
 10. Writer-1. Commit. Swaps `metadata-2` for `metadata-3`.
 
-At this point a table scan will return row `['jack', 'blue', 'A']` even though it should have been deleted.
+At this point a table scan will return row `['jack', 'blue', 'A']` even though it should have been deleted. Whether we use a total ordering of UPDATE then DELETE or DELETE then UPDATE, the 'jack' row should not exist in table version 3.
 
 The issue is that in the Spark Iceberg code thr `SparkPositionDeltaWrite` only enables the validation checks necessary to avoid this when the command is an UPDATE or MERGE, not a DELETE. https://github.com/apache/iceberg/blob/e02b5c90ef305b4d1ca5c19f0b9b2e99f9392e44/spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkPositionDeltaWrite.java#L219
 
