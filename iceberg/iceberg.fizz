@@ -21,28 +21,29 @@
 
 # MERGE command not supported
 TableMode = enum('COPY_ON_WRITE', 'MERGE_ON_READ')
-<<<<<<< Updated upstream
-CONFIGURED_TABLE_MODE = TableMode.MERGE_ON_READ
-=======
 UPDATE_MODE = TableMode.MERGE_ON_READ
 DELETE_MODE = TableMode.MERGE_ON_READ
->>>>>>> Stashed changes
 
 Isolation = enum('SERIALIZABLE', 'SNAPSHOT_ISOLATION')
 CONFIGURED_ISOLATION = Isolation.SNAPSHOT_ISOLATION
-NUM_WRITERS = 2
+NUM_WRITERS = 3
+
+# Spark has a consistency bug where it doesn't run a key validation check
+# for SQL deletes that execute as Iceberg Overwrite ops. Set this
+# to true to avoid the model checker from detecting this consistency bug.
+FIX_SPARK_BUG = True
 
 # State space limiting constants
 ALLOW_UPDATES = True               # Include update queries
 ALLOW_DELETES = True               # Include delete queries
-MAX_WRITE_OPS = 3                  # The max number of write operations
-MAX_COMPACTION_OPS = 0             # The max number of compactions
+MAX_WRITE_OPS = 5                  # The max number of write operations
+MAX_COMPACTION_OPS = 3             # The max number of compactions
 
 # Column values, each col1 value represents a possible row in the table.
 # Col 1 values are not duplicated, so if there are 2 values then there are 2 possible rows.
-Col1Values = ['jack']
-Col2Values = ['red', 'blue']
-Col3Values = ['A']
+Col1Values = ['jack', 'sarah']
+Col2Values = ['apple', 'orange', 'banana']
+Col3Values = ['A', 'B']
 
 State = enum('READY', 'READ_DATA_FILES', 'WRITE_DATA_FILES', 'WRITE_METADATA_FILES',
              'PREPARE_COMMIT', 'COMMIT', 'COMMITTED', 'ABORTED', 'BAD_STATE')
@@ -201,12 +202,13 @@ atomic func GetDeleteFiles(metadata):
                 if entry.status != ManifestEntryStatus.DELETED:
                     delete_file = object_store.Read(entry.data_file.file_path)
                     rec = record(sequence_no = entry.data_sequence_no,
-                                 delete_file = delete_file)
+                                 delete_file = delete_file,
+                                 file_path = entry.data_file.file_path)
                     delete_files.append(rec)
 
     return delete_files
 
-atomic func IsDeleted(delete_files, entry, row_index):
+atomic func MatchingDeleteFile(delete_files, entry, row_index):
     # evaluates whether a given row_index of a data file is deleted or not.
 
     for delete in delete_files:
@@ -214,9 +216,9 @@ atomic func IsDeleted(delete_files, entry, row_index):
             for del_row in delete.delete_file:
                 if (del_row[0] == entry.data_file.file_path
                         and del_row[1] == row_index):
-                    return True
+                    return delete
     
-    return False
+    return None
 
 atomic func IsMatch(row, predicate):
     # Evaluates whether the row matches the predicate.
@@ -258,16 +260,20 @@ atomic func Scan(metadata_location, predicate):
                          or entry.status == ManifestEntryStatus.EXISTING)):
                 data_file = object_store.Read(entry.data_file.file_path)
                 data_file_result = record(file_path = data_file.file_path,
-                                          rows = [])
+                                          rows = [], 
+                                          applied_del_files = set())
                 for row_index in range(len(data_file.rows)):
                     row = data_file.rows[row_index]
-                    is_deleted = IsDeleted(delete_files, entry, row_index)
                     is_match = IsMatch(row, predicate)
-                    if not is_deleted and is_match:
-                        row_rec = record(row_index = row_index, row = row)
-                        data_file_result.rows.append(row_rec)            
-
-                if len(data_file_result.rows) > 0:
+                    if is_match:
+                        del_file_match = MatchingDeleteFile(delete_files, entry, row_index)
+                        if del_file_match == None:
+                            row_rec = record(row_index = row_index, row = row)
+                            data_file_result.rows.append(row_rec)
+                        else:
+                            data_file_result.applied_del_files.add(del_file_match.file_path)
+                        
+                if len(data_file_result.rows) > 0 or len(data_file_result.applied_del_files) > 0:
                     scan.append(data_file_result)
 
     return scan
@@ -466,6 +472,10 @@ role Writer:
 
         for data_file_result in scan_result:
             data_file = object_store.Read(data_file_result.file_path)
+            if len(data_file.rows) == 0:
+                # can only happen with MOR and all rows deleted
+                continue
+
             original_file_paths.append(data_file.file_path)
             new_rows = []
 
@@ -510,6 +520,10 @@ role Writer:
         new_rows = []
 
         for data_file_result in scan_result:
+            if len(data_file_result.rows) == 0:
+                # can only happen with MOR and all rows deleted
+                continue
+
             for row_result in data_file_result.rows:
                 row = row_result.row
                 if self.op.sql_op == SqlOpType.DELETE or self.op.sql_op == SqlOpType.UPDATE:
@@ -582,10 +596,22 @@ role Writer:
         elif op.data_op == DataOp.REPLACE:
             file_path = DataFileName()
             rows = []
+                        
             for data_file_result in op.compaction_scan:
+                # add the data file of the scan to the deleted data files
                 op.deleted_data_files.append(data_file_result.file_path)
                 for row_result in data_file_result.rows:
                     rows.append(row_result.row)
+
+                # Add any delete files that were applied when scanning this data
+                # file, to the deleted delete files. This is custom to this spec,
+                # as dangling delete files in Iceberg are actually removed in
+                # delete file compaction, which is not modeled in this spec (only
+                # data file compaction). But leaving dangling delete files violates
+                # an invariant that I would like to keep.
+                for applied_del_file in data_file_result.applied_del_files:
+                    if applied_del_file not in op.deleted_delete_files:
+                        op.deleted_delete_files.append(applied_del_file)
 
             data_file = record(file_path = file_path, rows = rows)
             object_store.Write(file_path, data_file)
@@ -756,7 +782,11 @@ role Writer:
         if result == Result.VALIDATION_FAILED:
            return result
 
-        if self.op.sql_op == SqlOpType.UPDATE:
+        check_ops = [SqlOpType.UPDATE]
+        if FIX_SPARK_BUG:
+            check_ops.append(SqlOpType.DELETE)
+
+        if self.op.sql_op in check_ops:
             result = self.ValidateNoNewDeletes(current_metadata, 
                                                starting_snapshot_id)
             if result == Result.VALIDATION_FAILED:
@@ -954,6 +984,11 @@ role Writer:
                             and entry.data_sequence_no < min_data_seq_no):
                         entry.status = ManifestEntryStatus.DELETED
                         actual_deleted_files.add(entry.data_file.file_path)
+                    elif entry.data_file.file_path in self.op.deleted_delete_files:
+                        # This case does not exist in Iceberg in reality, but I've added delete file
+                        # deletion to normal compaction to avoid dangling delete files.
+                        entry.status = ManifestEntryStatus.DELETED
+                        actual_deleted_files.add(entry.data_file.file_path)
                     else:
                         entry.status = ManifestEntryStatus.EXISTING
             existing_delete_manifests.append(manifest_file)
@@ -1064,15 +1099,15 @@ role Writer:
 
         if len(self.op.added_delete_files) > 0 or len(delete_manifest_list) > 0:
             delete_res = self.GenerateDeleteManifestFiles(delete_manifest_list,
-                                                            sequence_no,
-                                                            data_res.min_data_seq_no,
-                                                            new_snapshot_id)
-            
+                                                          sequence_no,
+                                                          data_res.min_data_seq_no,
+                                                          new_snapshot_id)
 
             if (self.op.snapshot_update == SnapshotUpdateType.REWRITE_FILES):
-                # Not currently modeled as this only occurs for a deleted file compaction which
-                # this spec does not support.
-                validation_res = self.ValidateDeletedFilesGotDeleted(data_res.actual_deleted_files, 
+                # In this spec, I've made data file compaction also remove dangling delete files,
+                # so this is called for data file compaction. But in reality, delete file
+                # compaction is run separately from data file compaction.
+                validation_res = self.ValidateDeletedFilesGotDeleted(delete_res.actual_deleted_files, 
                                                                      self.op.deleted_delete_files)
                 if validation_res == Result.VALIDATION_FAILED:
                     self.Abort()
@@ -1281,12 +1316,25 @@ always assertion ConsistentRead:
                 model_value = ReadColFromHistoryModel(version, id_col, col)
                 scan_result = Scan(metadata_location, [id_col, None, None])
 
-                if len(scan_result) > 1 or (len(scan_result) == 1 and len(scan_result[0].rows) > 1):
+                file_match = None
+                file_matches = 0
+                for file_result in scan_result:
+                    if len(file_result.rows) > 0:
+                        file_match = file_result
+                        file_matches += 1
+                
+                if file_matches > 1:
                     # if would mean there are duplicates which is a violation of this spec
+                    print("CONSISTENCY VIOLATION!")
+                    print("Duplicate rows for " + id_col + " in version " + str(version))
+                    print(scan_result)
                     return False
 
                 # this is a lookup by id column, there should be only one row
-                actual_row = scan_result[0].rows[0].row if len(scan_result) == 1 else None
+                actual_row = file_match.rows[0].row if file_match != None else None
+
+                
+                #scan_result[0].rows[0].row if len(scan_result) == 1 and len(scan_result[0].rows) > 0 else None
                 
                 if model_value == None and actual_row == None:
                     continue
@@ -1296,6 +1344,7 @@ always assertion ConsistentRead:
                             + ", expected: None"
                             + ", actual: " + str(actual_row[col])
                             + ", actual row: " + str(actual_row))
+                    print(scan_result)
                     return False
                 elif model_value != None and actual_row == None:
                     print("Consistency violation!")
@@ -1303,6 +1352,7 @@ always assertion ConsistentRead:
                             + ", expected: " + str(model_value)
                             + ", actual: None"
                             + ", actual row: None")
+                    print(scan_result)
                     return False
                 elif model_value != actual_row[col]:
                     print("Consistency violation!")
@@ -1310,6 +1360,7 @@ always assertion ConsistentRead:
                             + ", expected: " + str(model_value)
                             + ", actual: " + str(actual_row[col])
                             + ", actual row: " + str(actual_row))
+                    print(scan_result)
                     return False
 
     return True

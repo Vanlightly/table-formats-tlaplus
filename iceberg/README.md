@@ -24,7 +24,7 @@ The following is not modeled:
 1. Partitions.
 2. Equality deletes
 3. Filter pushdown into Iceberg, such as delete expressions.
-4. Delete file compaction.
+4. Delete file compaction as a separate process. Instead, delete files are logically deleted when the data files they reference are also logically deleted.
 5. Snapshot expiry and associated file clean-up.
 
 ## State machine
@@ -54,7 +54,7 @@ History of FavColor column for row with id 'jack':
 2. value='blue', version=2
 3. value=None, version=3
 
-### Possible violation
+### Possible violation with how Spark uses Iceberg
 
 Model parameters:
 
@@ -120,3 +120,9 @@ The issue is that in the Spark Iceberg code thr `SparkPositionDeltaWrite` only e
 A simple fix would be to include DELETE commands.
 
 NEEDS TO BE VERIFIED BY AN ICEBERG COMMITTER.
+
+## Running it
+
+I recommend you use Fizzbee's simulation mode that does not perform brite force model checking but instead repeatedly executes a history, randomly picking its way through the state space.
+
+Simulation is currently single-threaded. You can parallelize it by running multiple instances of Fizzbee in parallel. There is a helper script for this, `run.sh`, but you must modify it to point to your Fizzbee GitHub repo, and also the number of concurrent processes you want to run.
