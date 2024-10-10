@@ -134,7 +134,9 @@ Any variable or function name with "aux" in it refers to auxilliary state and lo
 
 ## Reducing the state space.
 
-Fizzbee at the time of writing does not spill to disk and is therefore limited in the size of the state space. The following constants can be used to limit the state space:
+Fizzbee at the time of writing does not spill to disk and is therefore limited in the size of the state space. I recommend using simulation mode instead, but if you want brute force, the following will help reduce the state space.
+
+The following constants can be used to limit the state space:
 
 - `ALLOW_UPDATES` True/False. Allows or disallows streaming sink and read/modify/write updates.
 - `ALLOW_DELETES` True/False. Allows or disallows deletes.
@@ -161,3 +163,9 @@ PkCol1Values = ['jack', 'sarah', 'john']
 Col2Values = ['red', 'blue']
 Col3Values = ['A', 'B']
 ```
+
+## Running it
+
+I recommend you use Fizzbee's simulation mode that does not perform brite force model checking but instead repeatedly executes a history, randomly picking its way through the state space.
+
+Simulation is currently single-threaded. You can parallelize it by running multiple instances of Fizzbee in parallel. There is a helper script for this, `run.sh`, but you must modify it to point to your Fizzbee GitHub repo, and also the number of concurrent processes you want to run.
